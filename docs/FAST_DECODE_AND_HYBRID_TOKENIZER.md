@@ -208,6 +208,10 @@ training, not as the same model with a bigger head.
 - No CUDA measurement exists for any of this. The CUDA graph tests are written
   and skip on a host without a device; the benchmark reports the graph path only
   when CUDA is present.
+- Graph capture combined with BF16 autocast is written but unexecuted. Capture
+  disables the autocast weight cache, because a cast recorded once and replayed
+  many times is the documented hazard; run the CUDA graph tests on the target
+  device before trusting that combination.
 - The vocabulary is learned from pretokenizer pieces, not from a quality
   ablation. A vocabulary size is a hypothesis until bits per byte is compared at
   matched compute.

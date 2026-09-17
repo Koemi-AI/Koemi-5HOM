@@ -141,7 +141,10 @@ class BatchDecoder:
     validation, and never moves a tensor value to the host. `capture_graph`
     replays one captured CUDA graph per step; it requires CUDA, a model without
     forward hooks and no warm token cache, and it fails at construction when CUDA
-    is absent instead of silently running the eager path.
+    is absent instead of silently running the eager path. Capture turns the
+    autocast weight cache off, because a cast recorded once and replayed many
+    times is the documented hazard of combining the two; that combination has not
+    been executed on a CUDA device from this repository.
     """
 
     def __init__(
@@ -274,7 +277,11 @@ class BatchDecoder:
     def _autocast(self):
         if self._autocast_dtype is None:
             return nullcontext()
-        return torch.autocast(device_type=self.device.type, dtype=self._autocast_dtype)
+        return torch.autocast(
+            device_type=self.device.type,
+            dtype=self._autocast_dtype,
+            cache_enabled=not self._capture_graph,
+        )
 
     def _normalize_step_input(self, token_ids: Tensor) -> Tensor:
         if not isinstance(token_ids, Tensor):
