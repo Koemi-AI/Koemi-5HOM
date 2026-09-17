@@ -8,15 +8,26 @@ from typing import Sequence
 
 import torch
 
-from koemi.configuration.settings import ModelSettings, TrainingSettings
+from koemi.configuration.settings import BYTE_VOCABULARY_SIZE, ModelSettings, TrainingSettings
+from koemi.data import create_tokenizer
 from koemi.data.adapters import SUPPORTED_DATASET_FORMATS
+from koemi.data.hybrid_tokenizer import HybridVocabulary, train_hybrid_vocabulary
 from koemi.data.readers import DatasetLoadReport, load_dataset_records, split_dataset_records
-from koemi.data.serialization import build_answer_prompt, build_thinking_prompt, strip_prompt
-from koemi.data.tokenizer import ByteTokenizer
+from koemi.data.serialization import (
+    ANSWER_TARGET,
+    THINKING_TARGET,
+    build_answer_prompt,
+    build_thinking_prompt,
+    encode_prompt,
+    record_segments,
+    strip_prompt,
+)
+from koemi.data.tokenizer import TextTokenizer
 from koemi.model.cache import DiskMappingCache, WarmTokenCache
 from koemi.model.network import KoemiModel
 from koemi.observability.logging import configure_logging
 from koemi.runtime.bulk_prefix_cache import BulkPrefixCache
+from koemi.runtime.fast_decode import SamplingPolicy, generate_batch
 from koemi.runtime.offload import (
     ACCELERATOR_TIER,
     DISK_TIER,
@@ -25,7 +36,8 @@ from koemi.runtime.offload import (
     OffloadRequest,
     prepare_offload,
 )
-from koemi.training.checkpoints import CheckpointStore
+from koemi.runtime.speculative import ModelDrafter, NgramDrafter, speculative_generate
+from koemi.training.checkpoints import CheckpointStore, expand_model_vocabulary
 from koemi.training.dataset import CausalByteDataset, create_training_loader
 from koemi.training.generation import generate_text
 from koemi.training.trainer import Trainer
@@ -42,8 +54,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return train_model(parsed_arguments, logger)
         if parsed_arguments.command == "generate":
             return generate_completion(parsed_arguments, logger)
+        if parsed_arguments.command == "build-vocabulary":
+            return build_vocabulary(parsed_arguments, logger)
+        if parsed_arguments.command == "expand-vocabulary":
+            return expand_vocabulary(parsed_arguments, logger)
         parser.error(f"unsupported command: {parsed_arguments.command}")
-    except (FileNotFoundError, ValueError, RuntimeError) as error:
+    except (FileExistsError, FileNotFoundError, ValueError, RuntimeError) as error:
         logger.error("command_failed error=%s", error)
         return 2
     return 2
@@ -91,8 +107,30 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional token-length bucket width for training batches",
     )
+    train_parser.add_argument(
+        "--vocabulary",
+        default=None,
+        help="Hybrid vocabulary JSON; without it the model trains on raw bytes",
+    )
     add_offload_arguments(train_parser)
     add_model_arguments(train_parser)
+
+    vocabulary_parser = subparsers.add_parser(
+        "build-vocabulary", help="Learn a hybrid word and subword vocabulary from datasets"
+    )
+    add_dataset_arguments(vocabulary_parser)
+    vocabulary_parser.add_argument("--output", required=True, help="Vocabulary JSON path")
+    vocabulary_parser.add_argument("--vocabulary-size", type=int, default=8192)
+    vocabulary_parser.add_argument("--minimum-frequency", type=int, default=2)
+    vocabulary_parser.add_argument("--overwrite", action="store_true")
+
+    expand_parser = subparsers.add_parser(
+        "expand-vocabulary", help="Migrate a byte checkpoint to a hybrid vocabulary"
+    )
+    expand_parser.add_argument("--checkpoint", required=True, help="Existing checkpoint path")
+    expand_parser.add_argument("--vocabulary", required=True, help="Hybrid vocabulary JSON path")
+    expand_parser.add_argument("--output", required=True, help="Expanded checkpoint path")
+    expand_parser.add_argument("--overwrite", action="store_true")
 
     generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-3HIP checkpoint")
     generate_parser.add_argument("--checkpoint", required=True, help="Checkpoint path")
@@ -130,6 +168,33 @@ def create_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--bulk-prefix-cache-disk-capacity", type=int, default=128)
     generate_parser.add_argument("--bulk-prefix-cache-max-entry-mib", type=int, default=64)
     generate_parser.add_argument("--bulk-prefix-cache-ttl-seconds", type=float, default=3600.0)
+    generate_parser.add_argument(
+        "--fast-decode",
+        action="store_true",
+        help="Decode through the fixed-shape loop without a per-token host synchronization",
+    )
+    generate_parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="Replay one captured CUDA graph per decode step; requires --fast-decode and CUDA",
+    )
+    generate_parser.add_argument("--top-k", type=int, default=None)
+    generate_parser.add_argument(
+        "--greedy", action="store_true", help="Take the highest scoring token at every step"
+    )
+    generate_parser.add_argument(
+        "--draft-checkpoint",
+        default=None,
+        help="Smaller checkpoint that proposes speculative blocks",
+    )
+    generate_parser.add_argument(
+        "--ngram-draft",
+        action="store_true",
+        help="Propose speculative blocks from repeated context instead of a draft model",
+    )
+    generate_parser.add_argument("--draft-length", type=int, default=4)
+    generate_parser.add_argument("--ngram-maximum-order", type=int, default=8)
+    generate_parser.add_argument("--ngram-minimum-order", type=int, default=2)
     add_offload_arguments(generate_parser)
     return parser
 
@@ -234,7 +299,9 @@ def inspect_dataset(arguments: argparse.Namespace, logger) -> int:
 
 def train_model(arguments: argparse.Namespace, logger) -> int:
     report = load_and_log_dataset(arguments.dataset, arguments.dataset_format, logger)
-    model_settings = create_model_settings(arguments)
+    vocabulary = None if arguments.vocabulary is None else HybridVocabulary.load(arguments.vocabulary)
+    tokenizer = create_tokenizer(vocabulary)
+    model_settings = create_model_settings(arguments, tokenizer.vocabulary_size)
     training_settings = TrainingSettings(
         sequence_length=arguments.sequence_length,
         batch_size=arguments.batch_size,
@@ -259,7 +326,7 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
     training_records, validation_records = split_dataset_records(
         report.records, arguments.validation_fraction, arguments.seed
     )
-    dataset = CausalByteDataset(training_records, training_settings.sequence_length)
+    dataset = CausalByteDataset(training_records, training_settings.sequence_length, tokenizer)
     loader = create_training_loader(
         dataset,
         training_settings.batch_size,
@@ -272,7 +339,9 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
     )
     validation_loader = None
     if validation_records:
-        validation_dataset = CausalByteDataset(validation_records, training_settings.sequence_length)
+        validation_dataset = CausalByteDataset(
+            validation_records, training_settings.sequence_length, tokenizer
+        )
         validation_loader = create_training_loader(
             validation_dataset,
             training_settings.batch_size,
@@ -291,7 +360,9 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         if engine is not None:
             log_offload(engine, logger)
             engine.detach()
-    checkpoint_path = CheckpointStore().save(arguments.checkpoint, model, overwrite=arguments.overwrite)
+    checkpoint_path = CheckpointStore().save(
+        arguments.checkpoint, model, overwrite=arguments.overwrite, vocabulary=vocabulary
+    )
     logger.info(
         "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f thinking_loss=%.6f "
         "mean_surprise=%.4f validation_loss=%s validation_perplexity=%s optimizer_steps=%s "
@@ -341,8 +412,7 @@ def attach_offload(
 
 def attach_inference_offload(
     model: KoemiModel,
-    tokenizer: ByteTokenizer,
-    prompt: str,
+    prompt_ids: Sequence[int],
     arguments: argparse.Namespace,
     logger,
 ) -> OffloadEngine | None:
@@ -351,11 +421,11 @@ def attach_inference_offload(
         return None
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    prompt_ids = torch.tensor([tokenizer.encode(prompt)], dtype=torch.long, device=arguments.device)
+    calibration_ids = torch.tensor([list(prompt_ids)], dtype=torch.long, device=arguments.device)
 
     def calibration_forward() -> None:
         with torch.no_grad():
-            model(prompt_ids)
+            model(calibration_ids)
 
     engine = prepare_offload(model, calibration_forward, request, arguments.device)
     log_offload(engine, logger)
@@ -370,6 +440,117 @@ def resolve_prompt(arguments: argparse.Namespace) -> str:
     if arguments.prompt_target == "thinking":
         return build_thinking_prompt(arguments.system, arguments.prompt)
     return build_answer_prompt(arguments.system, arguments.prompt)
+
+
+def resolve_prompt_ids(tokenizer: TextTokenizer, arguments: argparse.Namespace) -> list[int]:
+    """Encode the prompt span by span, the way training serialized the same markers."""
+    if arguments.raw_prompt:
+        return list(tokenizer.encode(arguments.prompt))
+    target = THINKING_TARGET if arguments.prompt_target == "thinking" else ANSWER_TARGET
+    return encode_prompt(tokenizer, arguments.system, arguments.prompt, target)
+
+
+def sampling_policy(arguments: argparse.Namespace) -> SamplingPolicy:
+    return SamplingPolicy(
+        temperature=arguments.temperature,
+        top_k=arguments.top_k,
+        greedy=arguments.greedy,
+    )
+
+
+def build_vocabulary(arguments: argparse.Namespace, logger) -> int:
+    report = load_and_log_dataset(arguments.dataset, arguments.dataset_format, logger)
+    output_path = Path(arguments.output).expanduser().resolve()
+    if output_path.exists() and not arguments.overwrite:
+        raise FileExistsError(f"vocabulary already exists: {output_path}")
+    corpus = tuple(
+        segment.text for record in report.records for segment in record_segments(record)
+    )
+    vocabulary = train_hybrid_vocabulary(
+        corpus,
+        arguments.vocabulary_size,
+        minimum_frequency=arguments.minimum_frequency,
+    )
+    saved_path = vocabulary.save(output_path)
+    logger.info(
+        "vocabulary_built path=%s vocabulary_size=%s merges=%s records=%s",
+        saved_path,
+        vocabulary.vocabulary_size,
+        len(vocabulary.merges),
+        report.record_count,
+    )
+    write_utf8(
+        json.dumps(
+            {
+                "vocabulary": str(saved_path),
+                "vocabulary_size": vocabulary.vocabulary_size,
+                "merges": len(vocabulary.merges),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def expand_vocabulary(arguments: argparse.Namespace, logger) -> int:
+    vocabulary = HybridVocabulary.load(arguments.vocabulary)
+    loaded_checkpoint = CheckpointStore().load(arguments.checkpoint, "cpu")
+    expanded_model = expand_model_vocabulary(loaded_checkpoint.model, vocabulary)
+    output_path = CheckpointStore().save(
+        arguments.output, expanded_model, overwrite=arguments.overwrite, vocabulary=vocabulary
+    )
+    logger.info(
+        "vocabulary_expanded checkpoint=%s previous_vocabulary_size=%s vocabulary_size=%s",
+        output_path,
+        loaded_checkpoint.model_settings.vocabulary_size,
+        vocabulary.vocabulary_size,
+    )
+    write_utf8(
+        json.dumps(
+            {
+                "checkpoint": str(output_path),
+                "previous_vocabulary_size": loaded_checkpoint.model_settings.vocabulary_size,
+                "vocabulary_size": vocabulary.vocabulary_size,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def run_speculative_generation(
+    model: KoemiModel,
+    tokenizer: TextTokenizer,
+    prompt: str,
+    prompt_ids: Sequence[int],
+    arguments: argparse.Namespace,
+):
+    """Generate with block verification, drafting from repeated context or a small model."""
+    if arguments.ngram_draft:
+        drafter = NgramDrafter(
+            tokenizer.vocabulary_size,
+            arguments.device,
+            maximum_order=arguments.ngram_maximum_order,
+            minimum_order=arguments.ngram_minimum_order,
+        )
+    else:
+        draft_checkpoint = CheckpointStore().load(arguments.draft_checkpoint, arguments.device)
+        if draft_checkpoint.model_settings.vocabulary_size != model.settings.vocabulary_size:
+            raise ValueError("the draft checkpoint must share the target vocabulary")
+        drafter = ModelDrafter(draft_checkpoint.model, policy=sampling_policy(arguments))
+    return speculative_generate(
+        model,
+        tokenizer,
+        prompt,
+        arguments.max_new_bytes,
+        drafter=drafter,
+        device=arguments.device,
+        policy=sampling_policy(arguments),
+        draft_length=arguments.draft_length,
+        prompt_token_ids=prompt_ids,
+    )
 
 
 def generate_completion(arguments: argparse.Namespace, logger) -> int:
@@ -412,27 +593,74 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
     )
     if mapping_cache is not None and arguments.clear_mapping_cache:
         logger.info("mapping_cache_cleared entries=%s", mapping_cache.clear())
-    tokenizer = ByteTokenizer()
+    tokenizer = create_tokenizer(loaded_checkpoint.vocabulary)
     prompt = resolve_prompt(arguments)
-    engine = attach_inference_offload(loaded_checkpoint.model, tokenizer, prompt, arguments, logger)
+    prompt_ids = resolve_prompt_ids(tokenizer, arguments)
+    speculative_requested = arguments.ngram_draft or arguments.draft_checkpoint is not None
+    if speculative_requested and arguments.fast_decode:
+        raise ValueError("--fast-decode and speculative drafting are mutually exclusive")
+    if arguments.ngram_draft and arguments.draft_checkpoint is not None:
+        raise ValueError("--ngram-draft and --draft-checkpoint are mutually exclusive")
+    if arguments.cuda_graph and not arguments.fast_decode:
+        raise ValueError("--cuda-graph requires --fast-decode")
+    if (speculative_requested or arguments.fast_decode) and (
+        mapping_cache is not None or bulk_prefix_cache is not None
+    ):
+        raise ValueError("prefix caches are only available on the default decode path")
+    engine = attach_inference_offload(loaded_checkpoint.model, prompt_ids, arguments, logger)
+    speculative_statistics = None
     try:
-        completion = generate_text(
-            loaded_checkpoint.model,
-            tokenizer,
-            prompt,
-            arguments.max_new_bytes,
-            arguments.temperature,
-            arguments.device,
-            warm_cache,
-            mapping_cache,
-            bulk_prefix_cache,
-        )
+        if speculative_requested:
+            speculative_result = run_speculative_generation(
+                loaded_checkpoint.model, tokenizer, prompt, prompt_ids, arguments
+            )
+            generated_text = speculative_result.text
+            speculative_statistics = speculative_result.statistics
+        elif arguments.fast_decode:
+            generated_text = generate_batch(
+                loaded_checkpoint.model,
+                tokenizer,
+                (prompt,),
+                arguments.max_new_bytes,
+                device=arguments.device,
+                policy=sampling_policy(arguments),
+                capture_graph=arguments.cuda_graph,
+                prompt_token_ids=(prompt_ids,),
+            ).texts[0]
+        else:
+            generated_text = strip_prompt(
+                generate_text(
+                    loaded_checkpoint.model,
+                    tokenizer,
+                    prompt,
+                    arguments.max_new_bytes,
+                    arguments.temperature,
+                    arguments.device,
+                    warm_cache,
+                    mapping_cache,
+                    bulk_prefix_cache,
+                    prompt_token_ids=prompt_ids,
+                ),
+                prompt,
+            )
     finally:
         if engine is not None:
             log_offload(engine, logger)
             engine.detach()
-    if not arguments.raw_prompt:
-        completion = strip_prompt(completion, prompt)
+    completion = f"{prompt}{generated_text}" if arguments.raw_prompt else generated_text
+    if speculative_statistics is not None:
+        logger.info(
+            "speculative_decoding rounds=%s proposed_tokens=%s accepted_draft_tokens=%s "
+            "committed_tokens=%s target_forward_calls=%s acceptance_rate=%.4f "
+            "tokens_per_target_call=%.4f",
+            speculative_statistics.rounds,
+            speculative_statistics.proposed_tokens,
+            speculative_statistics.accepted_draft_tokens,
+            speculative_statistics.committed_tokens,
+            speculative_statistics.target_forward_calls,
+            speculative_statistics.acceptance_rate,
+            speculative_statistics.tokens_per_target_call,
+        )
     statistics = warm_cache.statistics()
     mapping_statistics = mapping_cache.statistics() if mapping_cache is not None else None
     bulk_statistics = bulk_prefix_cache.statistics() if bulk_prefix_cache is not None else None
@@ -442,7 +670,7 @@ def generate_completion(arguments: argparse.Namespace, logger) -> int:
         "prefix_hits=%s prefix_misses=%s prefix_tokens_reused=%s "
         "bulk_block_hits=%s bulk_block_misses=%s bulk_ram_hits=%s bulk_disk_hits=%s "
         "bulk_evictions=%s bulk_expirations=%s",
-        len(completion.encode("utf-8")),
+        len(generated_text.encode("utf-8")),
         statistics.hits,
         statistics.misses,
         statistics.evictions,
@@ -476,8 +704,12 @@ def load_and_log_dataset(dataset_paths: list[str], dataset_format: str, logger) 
     return report
 
 
-def create_model_settings(arguments: argparse.Namespace) -> ModelSettings:
+def create_model_settings(
+    arguments: argparse.Namespace,
+    vocabulary_size: int = BYTE_VOCABULARY_SIZE + 1,
+) -> ModelSettings:
     return ModelSettings(
+        vocabulary_size=vocabulary_size,
         embedding_size=arguments.embedding_size,
         memory_features=arguments.memory_features,
         local_memory_size=arguments.local_memory_size,

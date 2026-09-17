@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from torch import Tensor, nn
 from torch.nn import functional
@@ -13,6 +15,16 @@ HASH_WIDTH_MASK = 0xFFFFFFFF
 HASH_MIX_MULTIPLIER = 0x45D9F3B
 HASH_MIX_SHIFT = 16
 UNASSIGNED_EXPERT = -1
+
+
+@dataclass(frozen=True)
+class StackedExpertWeights:
+    gate_weights: Tensor
+    gate_biases: Tensor
+    value_weights: Tensor
+    value_biases: Tensor
+    output_weights: Tensor
+    output_biases: Tensor
 
 
 def content_dispatch_hash(token_ids: Tensor, previous_token_ids: Tensor) -> Tensor:
@@ -41,6 +53,30 @@ class DeterministicExpertMixture(nn.Module):
             raise ValueError("top_k must be between one and expert_count")
         self.experts = nn.ModuleList(GatedFeedForward(embedding_size) for _ in range(expert_count))
         self.output_normalizer = RootMeanSquareNorm(embedding_size)
+        self._stacked_weights: StackedExpertWeights | None = None
+
+    def cache_stacked_experts(self) -> None:
+        """Stack the expert weights once so decoding stops rebuilding them per step.
+
+        The cache is only correct while the weights do not change. Call
+        `clear_stacked_experts` before training again, after loading a checkpoint
+        or after moving the module to another device. Raises when gradients are
+        enabled, because a cached stack would detach the experts from autograd.
+        """
+        if self.training or torch.is_grad_enabled():
+            raise RuntimeError("stacked expert weights can only be cached for inference")
+        if self.expert_count == 0:
+            self._stacked_weights = None
+            return
+        self._stacked_weights = self._stack_expert_weights()
+
+    def clear_stacked_experts(self) -> None:
+        """Drop the cached stack so the next call reads the live expert weights."""
+        self._stacked_weights = None
+
+    def _load_from_state_dict(self, *arguments, **keywords) -> None:
+        self._stacked_weights = None
+        super()._load_from_state_dict(*arguments, **keywords)
 
     def forward(
         self,
@@ -119,33 +155,32 @@ class DeterministicExpertMixture(nn.Module):
         mixed_context = torch.where(valid_rows.unsqueeze(-1), updated_context, flattened_context)
         return mixed_context.reshape_as(context), assignments[:, :, 0], assignments
 
+    def _stack_expert_weights(self) -> StackedExpertWeights:
+        return StackedExpertWeights(
+            gate_weights=torch.stack(tuple(expert.gate_projection.weight for expert in self.experts)),
+            gate_biases=torch.stack(tuple(expert.gate_projection.bias for expert in self.experts)),
+            value_weights=torch.stack(tuple(expert.value_projection.weight for expert in self.experts)),
+            value_biases=torch.stack(tuple(expert.value_projection.bias for expert in self.experts)),
+            output_weights=torch.stack(tuple(expert.output_projection.weight for expert in self.experts)),
+            output_biases=torch.stack(tuple(expert.output_projection.bias for expert in self.experts)),
+        )
+
     def _apply_batched_experts(self, values: Tensor, expert_indices: Tensor) -> Tensor:
         if values.shape[0] == 0:
             return values
-        gate_weights = torch.stack(
-            tuple(expert.gate_projection.weight for expert in self.experts)
-        )
-        gate_biases = torch.stack(
-            tuple(expert.gate_projection.bias for expert in self.experts)
-        )
-        value_weights = torch.stack(
-            tuple(expert.value_projection.weight for expert in self.experts)
-        )
-        value_biases = torch.stack(
-            tuple(expert.value_projection.bias for expert in self.experts)
-        )
-        output_weights = torch.stack(
-            tuple(expert.output_projection.weight for expert in self.experts)
-        )
-        output_biases = torch.stack(
-            tuple(expert.output_projection.bias for expert in self.experts)
-        )
-        selected_gate_weights = gate_weights.index_select(0, expert_indices)
-        selected_gate_biases = gate_biases.index_select(0, expert_indices)
-        selected_value_weights = value_weights.index_select(0, expert_indices)
-        selected_value_biases = value_biases.index_select(0, expert_indices)
-        selected_output_weights = output_weights.index_select(0, expert_indices)
-        selected_output_biases = output_biases.index_select(0, expert_indices)
+        stacked = self._stacked_weights
+        if (
+            stacked is None
+            or stacked.gate_weights.device != values.device
+            or stacked.gate_weights.dtype != self.experts[0].gate_projection.weight.dtype
+        ):
+            stacked = self._stack_expert_weights()
+        selected_gate_weights = stacked.gate_weights.index_select(0, expert_indices)
+        selected_gate_biases = stacked.gate_biases.index_select(0, expert_indices)
+        selected_value_weights = stacked.value_weights.index_select(0, expert_indices)
+        selected_value_biases = stacked.value_biases.index_select(0, expert_indices)
+        selected_output_weights = stacked.output_weights.index_select(0, expert_indices)
+        selected_output_biases = stacked.output_biases.index_select(0, expert_indices)
         gate_values = torch.vmap(functional.linear)(
             values,
             selected_gate_weights,

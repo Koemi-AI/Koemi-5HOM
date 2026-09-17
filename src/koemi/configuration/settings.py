@@ -26,8 +26,8 @@ class ModelSettings:
     ablation: str = "no_refine"
 
     def __post_init__(self) -> None:
-        if self.vocabulary_size != BYTE_VOCABULARY_SIZE + 1:
-            raise ValueError("vocabulary_size must reserve one token for padding")
+        if self.vocabulary_size < BYTE_VOCABULARY_SIZE + 1:
+            raise ValueError("vocabulary_size must cover every byte value and the padding token")
         if self.embedding_size < 8:
             raise ValueError("embedding_size must be at least 8")
         if self.memory_features < 2:

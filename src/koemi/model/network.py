@@ -72,8 +72,11 @@ class KoemiModel(nn.Module):
         execution_mode: ExecutionMode = ExecutionMode.PARALLEL,
         warm_cache: WarmTokenCache | None = None,
         mapping_cache: DiskMappingCache | None = None,
+        *,
+        trusted_inputs: bool = False,
     ) -> KoemiOutput:
-        self.validate_input_ids(input_ids)
+        if not trusted_inputs:
+            self.validate_input_ids(input_ids)
         if (warm_cache is not None or mapping_cache is not None) and self.training:
             raise RuntimeError("inference caches are only valid while the model is in evaluation mode")
         root_forward = state is None
@@ -85,9 +88,9 @@ class KoemiModel(nn.Module):
                 if cached_mapping is not None:
                     return self.output_from_cached_mapping(cached_mapping, input_ids)
         if execution_mode is ExecutionMode.SEQUENTIAL:
-            output = self.forward_sequential(input_ids, state, warm_cache)
+            output = self.forward_sequential(input_ids, state, warm_cache, trusted_inputs=trusted_inputs)
         else:
-            output = self.forward_parallel(input_ids, state, warm_cache)
+            output = self.forward_parallel(input_ids, state, warm_cache, trusted_inputs=trusted_inputs)
         if mapping_cache is not None and root_forward:
             mapping_cache.put(
                 input_ids,
@@ -106,20 +109,44 @@ class KoemiModel(nn.Module):
     def initial_state(self, batch_size: int, device: torch.device) -> KoemiState:
         return KoemiState.create(batch_size, self.settings.embedding_size, self.settings.memory_features, device)
 
+    def cache_inference_weights(self) -> None:
+        """Precompute the stacked expert weights the decode path selects from.
+
+        Only valid while the parameters do not change; `train()` releases it.
+        """
+        self.experts.cache_stacked_experts()
+
+    def clear_inference_weights(self) -> None:
+        """Release the cached expert stack so the next forward reads live weights."""
+        self.experts.clear_stacked_experts()
+
+    def train(self, mode: bool = True) -> KoemiModel:
+        if mode:
+            self.clear_inference_weights()
+        super().train(mode)
+        return self
+
     def forward_parallel(
         self,
         input_ids: Tensor,
         state: KoemiState | None,
         warm_cache: WarmTokenCache | None,
+        *,
+        trusted_inputs: bool = False,
     ) -> KoemiOutput:
         batch_size, length = input_ids.shape
         current_state = state or self.initial_state(batch_size, input_ids.device)
         window = self.settings.scan_chunk
         if window >= length:
-            return self.forward_window(input_ids, current_state, warm_cache)
+            return self.forward_window(input_ids, current_state, warm_cache, trusted_inputs=trusted_inputs)
         windows: list[KoemiOutput] = []
         for start in range(0, length, window):
-            piece = self.forward_window(input_ids[:, start : start + window], current_state, warm_cache)
+            piece = self.forward_window(
+                input_ids[:, start : start + window],
+                current_state,
+                warm_cache,
+                trusted_inputs=trusted_inputs,
+            )
             windows.append(piece)
             current_state = piece.state
         return concatenate_outputs(windows)
@@ -129,6 +156,8 @@ class KoemiModel(nn.Module):
         input_ids: Tensor,
         current_state: KoemiState,
         warm_cache: WarmTokenCache | None,
+        *,
+        trusted_inputs: bool = False,
     ) -> KoemiOutput:
         _, length = input_ids.shape
         valid_mask = input_ids != PAD_TOKEN_ID
@@ -138,7 +167,14 @@ class KoemiModel(nn.Module):
         increment = torch.where(valid_mask.unsqueeze(-1), increment, torch.zeros_like(increment))
         working_states = affine_scan(retention, increment, current_state.working_state)
         if self.settings.ablation == "affine":
-            return self.forward_affine_window(input_ids, current_state, working_states, cache_hits, cache_misses)
+            return self.forward_affine_window(
+                input_ids,
+                current_state,
+                working_states,
+                cache_hits,
+                cache_misses,
+                trusted_inputs=trusted_inputs,
+            )
         prior_working_states = previous_states(working_states, current_state.working_state)
         surprise = (
             torch.zeros_like(input_ids, dtype=working_states.dtype)
@@ -253,7 +289,7 @@ class KoemiModel(nn.Module):
             surprise_values=surprise,
             expert_indices=expert_indices,
             valid_positions=valid_mask,
-            token_count=int(valid_mask.sum()),
+            token_count=count_valid_tokens(input_ids, valid_mask, trusted_inputs),
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
@@ -267,6 +303,8 @@ class KoemiModel(nn.Module):
         working_states: Tensor,
         cache_hits: int,
         cache_misses: int,
+        *,
+        trusted_inputs: bool = False,
     ) -> KoemiOutput:
         valid_mask = input_ids != PAD_TOKEN_ID
         next_state = KoemiState(
@@ -290,7 +328,7 @@ class KoemiModel(nn.Module):
             surprise_values=torch.zeros_like(working_states[..., 0]),
             expert_indices=torch.full_like(input_ids, -1),
             valid_positions=valid_mask,
-            token_count=int(valid_mask.sum()),
+            token_count=count_valid_tokens(input_ids, valid_mask, trusted_inputs),
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=0,
@@ -302,6 +340,8 @@ class KoemiModel(nn.Module):
         input_ids: Tensor,
         state: KoemiState | None,
         warm_cache: WarmTokenCache | None,
+        *,
+        trusted_inputs: bool = False,
     ) -> KoemiOutput:
         batch_size, length = input_ids.shape
         current_state = state or self.initial_state(batch_size, input_ids.device)
@@ -478,7 +518,7 @@ class KoemiModel(nn.Module):
             surprise_values=torch.stack(surprise_by_position, dim=1),
             expert_indices=expert_indices,
             valid_positions=valid_positions,
-            token_count=int(valid_positions.sum()),
+            token_count=count_valid_tokens(input_ids, valid_positions, trusted_inputs),
             cache_hits=cache_hits,
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
@@ -486,16 +526,27 @@ class KoemiModel(nn.Module):
         )
 
     def calculate_surprise(self, prior_states: Tensor, input_ids: Tensor, valid_mask: Tensor) -> Tensor:
-        content_logits = self.predict_tokens(prior_states)[..., :PAD_TOKEN_ID]
-        safe_input_ids = input_ids.clamp(max=PAD_TOKEN_ID - 1)
+        content_logits = self.content_logits(self.predict_tokens(prior_states))
+        content_size = content_logits.shape[-1]
+        safe_input_ids = torch.where(valid_mask, self.content_token_ids(input_ids), torch.zeros_like(input_ids))
         token_nll = functional.cross_entropy(
-            content_logits.reshape(-1, PAD_TOKEN_ID),
+            content_logits.reshape(-1, content_size),
             safe_input_ids.reshape(-1),
             reduction="none",
         ).view_as(input_ids)
-        normalized_nll = token_nll / math.log(PAD_TOKEN_ID)
+        normalized_nll = token_nll / math.log(content_size)
         surprise = 1.0 - torch.exp(-normalized_nll)
         return torch.where(valid_mask, surprise, torch.zeros_like(surprise))
+
+    def content_logits(self, logits: Tensor) -> Tensor:
+        if self.settings.vocabulary_size == PAD_TOKEN_ID + 1:
+            return logits[..., :PAD_TOKEN_ID]
+        return torch.cat((logits[..., :PAD_TOKEN_ID], logits[..., PAD_TOKEN_ID + 1 :]), dim=-1)
+
+    def content_token_ids(self, input_ids: Tensor) -> Tensor:
+        if self.settings.vocabulary_size == PAD_TOKEN_ID + 1:
+            return input_ids
+        return torch.where(input_ids > PAD_TOKEN_ID, input_ids - 1, input_ids)
 
     def predict_tokens(self, context: Tensor) -> Tensor:
         return self.token_predictor(context)
@@ -603,6 +654,17 @@ class KoemiModel(nn.Module):
             cache_misses=0,
             expert_count=self.settings.expert_count,
         )
+
+
+def count_valid_tokens(input_ids: Tensor, valid_mask: Tensor, trusted_inputs: bool) -> int:
+    """Count real tokens, skipping the device synchronization the caller vouched against.
+
+    `trusted_inputs` is the caller's promise that the batch carries no padding
+    token, so the count is the tensor size and `valid_mask` never reaches the host.
+    """
+    if trusted_inputs:
+        return input_ids.numel()
+    return int(valid_mask.sum())
 
 
 def concatenate_outputs(windows: list[KoemiOutput]) -> KoemiOutput:

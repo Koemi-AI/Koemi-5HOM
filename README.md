@@ -135,6 +135,74 @@ the checkpoint's `scan_chunk`; `--bulk-prefix-cache-namespace` is required, and
 the mapping and bulk prefix caches cannot be enabled together. RAM/SSD hit
 counters are logged as block probes, not as a claim about request-level speed.
 
+## Decode paths
+
+Three decode paths exist, and `generate` picks one. The default is unchanged.
+
+```bash
+.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-3hip.pt \
+  --prompt "Explain FIFO." --max-new-bytes 256 --fast-decode --greedy
+
+.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-3hip.pt \
+  --prompt "Explain FIFO." --max-new-bytes 256 --ngram-draft --draft-length 4
+```
+
+`--fast-decode` runs the fixed-shape loop: the recurrent rings are held at
+capacity, the decode inputs are marked trusted so the model skips its host-side
+validation, and sampling stays on the device. Add `--cuda-graph` to replay one
+captured CUDA graph per step; it requires `--fast-decode` and a CUDA device.
+
+`--ngram-draft` proposes a block from the most recent earlier occurrence of the
+current suffix and verifies the whole block in one windowed forward.
+`--draft-checkpoint PATH` proposes from a smaller model instead. Both log
+`acceptance_rate` and `tokens_per_target_call`; speculation is a loss when
+acceptance collapses, and those two numbers are how you see it.
+
+Neither path accepts a prefix cache, and neither uses the warm embedding cache,
+because both bypass the per-request cache boundary; `--cache-capacity` has no
+effect on them. Design, contracts and the CPU measurements are in
+[`docs/FAST_DECODE_AND_HYBRID_TOKENIZER.md`](docs/FAST_DECODE_AND_HYBRID_TOKENIZER.md).
+
+Serving code can use the same parts directly: `BatchDecoder` for a fixed-shape
+decode loop, `generate_batch` for several prompts at once, and
+`speculative_generate` with `NgramDrafter` or `ModelDrafter`.
+
+## Hybrid tokenizer
+
+A byte is a small unit of text, and the model spends one forward per unit. The
+optional hybrid tokenizer is byte-level BPE: ids `0-255` stay single bytes, `256`
+stays padding, `257-260` are the four span markers, and learned merges start at
+`261`. The byte alphabet gives total coverage, so an unseen character degrades to
+its own bytes instead of to an unknown token.
+
+```bash
+.venv/bin/python -m koemi build-vocabulary \
+  --dataset data/corpus.jsonl --output artifacts/vocabulary.json \
+  --vocabulary-size 8192
+
+.venv/bin/python -m koemi train \
+  --dataset data/corpus.jsonl --vocabulary artifacts/vocabulary.json \
+  --checkpoint artifacts/koemi-hybrid.pt
+```
+
+The vocabulary is stored inside the checkpoint, so `generate` needs no extra
+flag. Each record span is encoded separately, so no merged token crosses a span
+marker and the supervised mask stays aligned with the ids.
+
+An existing byte checkpoint migrates instead of being discarded:
+
+```bash
+.venv/bin/python -m koemi expand-vocabulary \
+  --checkpoint artifacts/koemi-3hip.pt \
+  --vocabulary artifacts/vocabulary.json \
+  --output artifacts/koemi-hybrid.pt
+```
+
+Every existing embedding and head row is copied unchanged; each new row starts at
+the mean of the rows of the bytes it expands to. The migrated checkpoint is a warm
+start, not the same model: surprise is normalized over the content vocabulary, so
+a larger vocabulary changes surprise and therefore the memory writes.
+
 ## Architecture
 
 ```mermaid
@@ -491,6 +559,17 @@ materialization counters, so a plan can be checked against the machine it ran on
 
 ## Benchmark
 
+`benchmarks/run_decode_benchmark.py` times the decode paths against each other on
+one device and writes a JSON report. It compares the baseline loop, fast decode,
+n-gram speculation and, when a draft checkpoint or `--synthetic-draft` is given,
+model speculation; the CUDA graph path is added only when CUDA is present.
+
+```bash
+.venv/bin/python benchmarks/run_decode_benchmark.py \
+  --checkpoint artifacts/koemi-3hip.pt --device cuda \
+  --max-new-tokens 256 --report artifacts/decode.json
+```
+
 The ready-to-run English analysis notebook is
 [`notebooks/Koemi-3HIP_Analysis.ipynb`](notebooks/Koemi-3HIP_Analysis.ipynb). It
 contains the bounded causal evaluator, explicit answer/thinking denominators,
@@ -564,10 +643,11 @@ confidence gate or salient ring.
   expert selection would reintroduce a router, contrary to this architecture.
 - The role markers are reserved. A dataset span or an inference prompt carrying
   `<|system|>`, `<|input|>`, `<|thinking|>` or `<|output|>` is refused at the
-  boundary, naming the field and the tag, because a byte vocabulary of 256 content
-  ids plus one padding id has no room for dedicated control tokens and forged text
-  would otherwise move a span boundary. `--raw-prompt` bypasses the check for a
-  checkpoint that was never trained with markers.
+  boundary, naming the field and the tag, because forged text would otherwise move
+  a span boundary. A byte vocabulary has no room for dedicated control tokens; the
+  hybrid vocabulary gives each marker one id but keeps the same refusal, since the
+  check protects the span boundary rather than the encoding. `--raw-prompt`
+  bypasses it for a checkpoint that was never trained with markers.
 - The offload store writes parameter files outside the checkpoint. Point
   `--offload-store` at a private directory: the files are plain weights and no
   namespace or expiry protects them.
@@ -585,7 +665,19 @@ confidence gate or salient ring.
   concurrency is tensor-level parallelism inside the causal scan window.
 - The associative tier and optional refine tier may still lose multi-key
   interactions. MQAR and long-context recall are still required.
-- UTF-8 byte tokenization uses more positions than a learned tokenizer.
+- UTF-8 byte tokenization uses more positions than a learned tokenizer. The
+  hybrid vocabulary closes that gap but changes the head, so a byte checkpoint
+  needs `expand-vocabulary` and further training; no quality ablation compares the
+  two vocabularies at matched compute.
+- The A100 runner in `src/koemi/training/a100_run.py` stores its token streams as
+  `bytes` and is byte-only. Hybrid training runs through the CLI trainer.
+- Fast decode and speculative decoding are measured on CPU only. The CUDA graph
+  path has tests that skip without a device, and the benchmark reports it only
+  when CUDA is present. Speculation loses when acceptance collapses; the reported
+  acceptance rate is the number that decides it, and no acceptance rate has been
+  measured on a trained checkpoint.
+- Speculative decoding handles one sequence at a time. Batched speculation needs
+  ragged acceptance handling that is not implemented.
 - No Triton kernel, distributed training, semantic retrieval, persistent
   episodic memory or tool use exists.
 - The optimization lab provides opt-in CUDA, context and batching seams. The
@@ -602,11 +694,11 @@ confidence gate or salient ring.
 ```text
 src/koemi/
   configuration/  Model and training settings
-  data/           JSON validation, adapters, serialization and tokenizer
+  data/           JSON validation, adapters, serialization, byte and hybrid tokenizers
   model/          HERM state, memory, cache, scan, CUDA seams and deterministic MoE
-  runtime/        parameter offload, inference batching, bulk blocks, prefix cache and async enqueue
-  training/       Causal chunks, objective, trainer, batching plan, checkpoint and generation
-benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines
+  runtime/        parameter offload, inference batching, bulk blocks, prefix cache, async enqueue, fast decode and speculation
+  training/       Causal chunks, objective, trainer, batching plan, checkpoint, vocabulary expansion and generation
+benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines, plus the decode path comparison
 tests/            Data, model, cache, execution and training contracts
 examples/         Valid JSON and JSONL inputs
 ```

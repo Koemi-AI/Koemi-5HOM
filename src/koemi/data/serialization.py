@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from koemi.data.contracts import (
@@ -10,6 +11,7 @@ from koemi.data.contracts import (
     DatasetRecord,
     reject_reserved_tags,
 )
+from koemi.data.tokenizer import TextTokenizer
 
 
 SYSTEM_MARKER = f"{SYSTEM_TAG}\n"
@@ -17,10 +19,34 @@ INPUT_MARKER = f"{INPUT_TAG}\n"
 THINKING_MARKER = f"\n{THINKING_TAG}\n"
 OUTPUT_MARKER = f"\n{OUTPUT_TAG}\n"
 
+ANSWER_TARGET = "answer"
+THINKING_TARGET = "thinking"
+
+
+@dataclass(frozen=True)
+class RecordSegment:
+    """One span of a serialized record with the supervision it carries.
+
+    Segments are the unit a tokenizer is allowed to see. Encoding them one by one
+    is what keeps a multi-byte token from straddling a span marker and shifting
+    the supervised mask.
+    """
+
+    text: str
+    supervised: bool
+    thinking: bool
+
 
 @dataclass(frozen=True)
 class SerializedRecord:
     token_bytes: bytes
+    supervised_positions: tuple[bool, ...]
+    thinking_positions: tuple[bool, ...]
+
+
+@dataclass(frozen=True)
+class SerializedTokenRecord:
+    token_ids: tuple[int, ...]
     supervised_positions: tuple[bool, ...]
     thinking_positions: tuple[bool, ...]
 
@@ -36,14 +62,39 @@ def system_prefix(system_text: str | None) -> str:
     return f"{SYSTEM_MARKER}{system_text}\n"
 
 
-def build_answer_prompt(system_text: str | None, user_text: str) -> str:
+def prompt_segments(system_text: str | None, user_text: str, target: str) -> tuple[str, ...]:
+    """Return the prompt spans in order, so a tokenizer can encode them separately."""
+    if target not in {ANSWER_TARGET, THINKING_TARGET}:
+        raise ValueError("prompt target must be answer or thinking")
     reject_prompt_tags(system_text, user_text)
-    return f"{system_prefix(system_text)}{INPUT_MARKER}{user_text}{OUTPUT_MARKER}"
+    closing_marker = OUTPUT_MARKER if target == ANSWER_TARGET else THINKING_MARKER
+    return (system_prefix(system_text), INPUT_MARKER, user_text, closing_marker)
+
+
+def build_answer_prompt(system_text: str | None, user_text: str) -> str:
+    return "".join(prompt_segments(system_text, user_text, ANSWER_TARGET))
 
 
 def build_thinking_prompt(system_text: str | None, user_text: str) -> str:
-    reject_prompt_tags(system_text, user_text)
-    return f"{system_prefix(system_text)}{INPUT_MARKER}{user_text}{THINKING_MARKER}"
+    return "".join(prompt_segments(system_text, user_text, THINKING_TARGET))
+
+
+def encode_segments(tokenizer: TextTokenizer, segments: Sequence[str]) -> list[int]:
+    """Encode each span on its own so no token crosses a span boundary."""
+    token_ids: list[int] = []
+    for segment in segments:
+        token_ids.extend(tokenizer.encode(segment))
+    return token_ids
+
+
+def encode_prompt(
+    tokenizer: TextTokenizer,
+    system_text: str | None,
+    user_text: str,
+    target: str = ANSWER_TARGET,
+) -> list[int]:
+    """Encode an inference prompt exactly the way training serialized the same spans."""
+    return encode_segments(tokenizer, prompt_segments(system_text, user_text, target))
 
 
 def strip_prompt(generated_text: str, prompt: str) -> str:
@@ -52,41 +103,55 @@ def strip_prompt(generated_text: str, prompt: str) -> str:
     return generated_text[len(prompt) :]
 
 
-def serialize_record(record: DatasetRecord) -> SerializedRecord:
-    prefix = system_prefix(record.system_text).encode("utf-8")
+def record_segments(record: DatasetRecord) -> tuple[RecordSegment, ...]:
+    """Return the ordered spans of a record with their supervision flags."""
+    prefix = system_prefix(record.system_text)
     if record.output_text is None:
-        body = record.input_text.encode("utf-8")
-        return SerializedRecord(
-            prefix + body,
-            tuple(False for _ in prefix) + tuple(True for _ in body),
-            tuple(False for _ in prefix + body),
+        return (
+            RecordSegment(prefix, False, False),
+            RecordSegment(record.input_text, True, False),
         )
-    segments: list[tuple[bytes, bool, bool]] = [
-        (prefix, False, False),
-        (INPUT_MARKER.encode("utf-8"), False, False),
-        (record.input_text.encode("utf-8"), False, False),
+    segments = [
+        RecordSegment(prefix, False, False),
+        RecordSegment(INPUT_MARKER, False, False),
+        RecordSegment(record.input_text, False, False),
     ]
     if record.thinking_text is not None:
-        segments.extend(
-            [
-                (THINKING_MARKER.encode("utf-8"), False, False),
-                (record.thinking_text.encode("utf-8"), True, True),
-            ]
-        )
-    segments.extend(
-        [
-            (OUTPUT_MARKER.encode("utf-8"), False, False),
-            (record.output_text.encode("utf-8"), True, False),
-        ]
+        segments.append(RecordSegment(THINKING_MARKER, False, False))
+        segments.append(RecordSegment(record.thinking_text, True, True))
+    segments.append(RecordSegment(OUTPUT_MARKER, False, False))
+    segments.append(RecordSegment(record.output_text, True, False))
+    return tuple(segments)
+
+
+def serialize_record(record: DatasetRecord) -> SerializedRecord:
+    segments = record_segments(record)
+    encoded = tuple((segment, segment.text.encode("utf-8")) for segment in segments)
+    return SerializedRecord(
+        b"".join(payload for _, payload in encoded),
+        tuple(segment.supervised for segment, payload in encoded for _ in payload),
+        tuple(segment.thinking for segment, payload in encoded for _ in payload),
     )
-    token_bytes = b"".join(segment for segment, _, _ in segments)
-    supervised_positions = tuple(
-        is_supervised for segment, is_supervised, _ in segments for _ in segment
+
+
+def serialize_record_tokens(
+    record: DatasetRecord,
+    tokenizer: TextTokenizer,
+) -> SerializedTokenRecord:
+    """Serialize a record into tokenizer ids with masks aligned to those ids."""
+    token_ids: list[int] = []
+    supervised_positions: list[bool] = []
+    thinking_positions: list[bool] = []
+    for segment in record_segments(record):
+        segment_ids = tokenizer.encode(segment.text)
+        token_ids.extend(segment_ids)
+        supervised_positions.extend(segment.supervised for _ in segment_ids)
+        thinking_positions.extend(segment.thinking for _ in segment_ids)
+    return SerializedTokenRecord(
+        tuple(token_ids),
+        tuple(supervised_positions),
+        tuple(thinking_positions),
     )
-    thinking_positions = tuple(
-        is_thinking for segment, _, is_thinking in segments for _ in segment
-    )
-    return SerializedRecord(token_bytes, supervised_positions, thinking_positions)
 
 
 def supervised_prefix_bytes(record: DatasetRecord) -> bytes:

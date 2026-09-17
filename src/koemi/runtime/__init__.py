@@ -1,4 +1,23 @@
 from koemi.runtime.bulk_prefix_cache import BulkPrefixCache
+from koemi.runtime.fast_decode import (
+    BatchDecoder,
+    BatchGeneration,
+    SamplingPolicy,
+    TokenSampler,
+    generate_batch,
+    to_static_state,
+)
+from koemi.runtime.speculative import (
+    AcceptanceResult,
+    DraftProposal,
+    Drafter,
+    ModelDrafter,
+    NgramDrafter,
+    SpeculativeGeneration,
+    SpeculativeStatistics,
+    accept_draft_tokens,
+    speculative_generate,
+)
 from koemi.runtime.inference_batching import (
     DECODE_PHASE,
     PREFILL_PHASE,
@@ -29,9 +48,24 @@ from koemi.runtime.offload import (
 )
 
 __all__ = [
+    "AcceptanceResult",
     "BulkPrefixCache",
     "BatchContract",
+    "BatchDecoder",
+    "BatchGeneration",
     "BatchingMetrics",
+    "DraftProposal",
+    "Drafter",
+    "ModelDrafter",
+    "NgramDrafter",
+    "SamplingPolicy",
+    "SpeculativeGeneration",
+    "SpeculativeStatistics",
+    "TokenSampler",
+    "accept_draft_tokens",
+    "generate_batch",
+    "speculative_generate",
+    "to_static_state",
     "DECODE_PHASE",
     "ACCELERATOR_TIER",
     "DISK_TIER",

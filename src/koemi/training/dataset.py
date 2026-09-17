@@ -10,7 +10,8 @@ from torch.utils.data import DataLoader, Dataset, Sampler
 
 from koemi.configuration.settings import PAD_TOKEN_ID
 from koemi.data.contracts import DatasetRecord, DatasetValidationError
-from koemi.data.serialization import serialize_record
+from koemi.data.serialization import serialize_record_tokens
+from koemi.data.tokenizer import ByteTokenizer, TextTokenizer
 from koemi.training.batching_mode import BatchingMode
 
 
@@ -25,7 +26,20 @@ class CausalChunk:
 
 
 class CausalByteDataset(Dataset[CausalChunk]):
-    def __init__(self, records: tuple[DatasetRecord, ...], sequence_length: int) -> None:
+    """Causal chunks with supervision masks aligned to the tokenizer output.
+
+    The default tokenizer is `ByteTokenizer`, which makes one chunk position one
+    byte. A hybrid tokenizer changes the ids without changing the contract,
+    because every span is encoded separately and the masks follow those ids.
+    """
+
+    def __init__(
+        self,
+        records: tuple[DatasetRecord, ...],
+        sequence_length: int,
+        tokenizer: TextTokenizer | None = None,
+    ) -> None:
+        self.tokenizer = tokenizer or ByteTokenizer()
         self.chunks = self.create_chunks(records, sequence_length)
         if not self.chunks:
             raise DatasetValidationError("dataset does not contain a trainable causal sequence")
@@ -43,8 +57,8 @@ class CausalByteDataset(Dataset[CausalChunk]):
             raise ValueError("sequence_length must be at least 1")
         chunks: list[CausalChunk] = []
         for record in records:
-            serialized_record = serialize_record(record)
-            token_ids = tuple(serialized_record.token_bytes)
+            serialized_record = serialize_record_tokens(record, self.tokenizer)
+            token_ids = serialized_record.token_ids
             if len(token_ids) < 2:
                 continue
             for start_index in range(0, len(token_ids) - 1, sequence_length):

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from koemi.configuration.settings import PAD_TOKEN_ID
-from koemi.data.tokenizer import ByteTokenizer
+from koemi.data.tokenizer import TextTokenizer
 from koemi.model.cache import CachedPrefixState, DiskMappingCache, WarmTokenCache
 from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel
@@ -265,7 +265,7 @@ def decode_step(
 
 def generate_text(
     model: KoemiModel,
-    tokenizer: ByteTokenizer,
+    tokenizer: TextTokenizer,
     prompt: str,
     max_new_bytes: int,
     temperature: float,
@@ -273,14 +273,24 @@ def generate_text(
     warm_cache: WarmTokenCache | None = None,
     mapping_cache: DiskMappingCache | None = None,
     bulk_prefix_cache: BulkPrefixCache | None = None,
+    *,
+    prompt_token_ids: Sequence[int] | None = None,
 ) -> str:
+    """Generate a continuation and return the prompt followed by it.
+
+    `prompt_token_ids` overrides the encoding of `prompt`. Pass it whenever the
+    prompt was built span by span, so the inference tokenization matches the one
+    training used for the same markers.
+    """
     if not prompt:
         raise ValueError("prompt must not be empty")
     if max_new_bytes < 1:
         raise ValueError("max_new_bytes must be at least 1")
     if temperature <= 0.0:
         raise ValueError("temperature must be positive")
-    prompt_ids = tokenizer.encode(prompt)
+    prompt_ids = list(tokenizer.encode(prompt) if prompt_token_ids is None else prompt_token_ids)
+    if not prompt_ids:
+        raise ValueError("prompt must encode to at least one token")
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     model.eval()
     generated_ids = list(prompt_ids)
@@ -322,8 +332,8 @@ def _normalize_prompt_input(input_ids: Tensor) -> Tensor:
         raise ValueError("prefill input_ids must have shape [1, sequence]")
     if input_ids.dtype != torch.long:
         raise TypeError("input_ids must use torch.long")
-    if bool(torch.any(input_ids < 0).item()) or bool(torch.any(input_ids >= PAD_TOKEN_ID).item()):
-        raise ValueError("input_ids must contain byte token IDs without padding")
+    if bool(torch.any(input_ids < 0).item()) or bool(torch.any(input_ids == PAD_TOKEN_ID).item()):
+        raise ValueError("input_ids must contain real token IDs without padding")
     return input_ids.detach()
 
 
