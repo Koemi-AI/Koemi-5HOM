@@ -37,11 +37,35 @@ class KoemiOutput:
     active_expert_indices: Tensor | None = None
 
     @property
+    def expert_activation_totals(self) -> Tensor | None:
+        """Return per-expert assignment counts as a device tensor, or None when empty.
+
+        One `bincount` over the valid assignments. Reading this to the host is the
+        caller's decision, which is what keeps a metric out of the training step's
+        critical path.
+        """
+        if self.expert_indices.numel() == 0 or self.expert_count == 0:
+            return None
+        assignments = (
+            self.active_expert_indices
+            if self.active_expert_indices is not None
+            else self.expert_indices.unsqueeze(-1)
+        )
+        counted = (
+            self.valid_positions.unsqueeze(-1)
+            & assignments.ge(0)
+            & assignments.lt(self.expert_count)
+        )
+        safe_assignments = assignments.clamp(0, self.expert_count - 1).reshape(-1)
+        totals = torch.zeros(self.expert_count, dtype=torch.long, device=assignments.device)
+        return totals.scatter_add_(0, safe_assignments, counted.reshape(-1).long())
+
+    @property
     def expert_activation_counts(self) -> tuple[int, ...]:
-        if self.expert_indices.numel() == 0:
-            return ()
-        assignments = self.active_expert_indices if self.active_expert_indices is not None else self.expert_indices.unsqueeze(-1)
-        return tuple(int((assignments == index).sum()) for index in range(self.expert_count))
+        totals = self.expert_activation_totals
+        if totals is None:
+            return () if self.expert_indices.numel() == 0 else (0,) * self.expert_count
+        return tuple(int(count) for count in totals.tolist())
 
 
 class KoemiModel(nn.Module):
@@ -172,8 +196,23 @@ class KoemiModel(nn.Module):
         never double-count a cache hit.
         """
         if not (self.settings.activation_checkpointing and self.training and torch.is_grad_enabled()):
-            return self.forward_window(input_ids, current_state, warm_cache, trusted_inputs=trusted_inputs)
+            return self.window_callable()(input_ids, current_state, warm_cache, trusted_inputs=trusted_inputs)
         return self.checkpointed_window(input_ids, current_state, trusted_inputs=trusted_inputs)
+
+    def window_callable(self):
+        """Return `forward_window`, wrapped by `torch.compile` when asked.
+
+        The wrapper is built once and cached on the module; Dynamo's own guards
+        handle a device, dtype or parameter change. `compile_forward` defaults to
+        false, so nothing is traced unless a caller asks for it.
+        """
+        if not self.settings.compile_forward:
+            return self.forward_window
+        compiled = getattr(self, "_compiled_window", None)
+        if compiled is None:
+            compiled = torch.compile(self.forward_window)
+            object.__setattr__(self, "_compiled_window", compiled)
+        return compiled
 
     def checkpointed_window(
         self,

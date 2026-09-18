@@ -34,6 +34,7 @@ DEFAULT_NUM_WORKERS = 2
 DEFAULT_CHECKPOINT_MINUTES = 10
 DEFAULT_LOG_INTERVAL_STEPS = 20
 DEFAULT_EVALUATION_BATCHES = 32
+AGGRESSIVE_BATCH_CANDIDATES = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,8 @@ class SafeA100Plan:
     evaluation_batches: int = DEFAULT_EVALUATION_BATCHES
     batching: str = canonical.LEGACY_BATCHING
     length_bucket_size: int = canonical.DEFAULT_LENGTH_BUCKET_SIZE
+    effective_batch_size: int = canonical.DEFAULT_EFFECTIVE_BATCH_SIZE
+    learning_rate: float = canonical.DEFAULT_LEARNING_RATE
     model_settings: canonical.ModelSettings | None = None
 
     def __post_init__(self) -> None:
@@ -74,6 +77,10 @@ class SafeA100Plan:
             raise ValueError("batching must be index or length")
         if self.length_bucket_size < 1:
             raise ValueError("length_bucket_size must be positive")
+        if isinstance(self.effective_batch_size, bool) or self.effective_batch_size < 1:
+            raise ValueError("effective_batch_size must be a positive integer")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be finite and positive")
         if self.model_settings is None:
             object.__setattr__(self, "model_settings", canonical.model_settings())
         for value, name in (
@@ -103,6 +110,17 @@ class SafeA100Plan:
         for name, value in asdict(self.quotas).items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"quota {name} must be a positive integer")
+
+    @property
+    def linear_scaled_learning_rate(self) -> float:
+        """Return the learning rate linear scaling suggests for this effective batch.
+
+        Reported, never applied. Raising the effective batch without raising the
+        learning rate changes the optimization, and choosing that is the operator's
+        call, not the launcher's.
+        """
+        reference = canonical.DEFAULT_EFFECTIVE_BATCH_SIZE
+        return canonical.DEFAULT_LEARNING_RATE * self.effective_batch_size / reference
 
     @property
     def requested_cost_usd(self) -> float:
@@ -144,6 +162,9 @@ class SafeA100Plan:
             "evaluation_batches": self.evaluation_batches,
             "batching": self.batching,
             "length_bucket_size": self.length_bucket_size,
+            "effective_batch_size": self.effective_batch_size,
+            "learning_rate": self.learning_rate,
+            "linear_scaled_learning_rate": self.linear_scaled_learning_rate,
             "model_settings": self.model_settings.to_dict(),
         }
 
@@ -190,6 +211,8 @@ def build_run_configuration(plan: SafeA100Plan) -> canonical.RunConfiguration:
         evaluation_batches=plan.evaluation_batches,
         batching=plan.batching,
         length_bucket_size=plan.length_bucket_size,
+        effective_batch_size=plan.effective_batch_size,
+        learning_rate=plan.learning_rate,
     )
 
 
@@ -198,8 +221,13 @@ def _aggressive_calibrate_batch_size(
     dataset: canonical.MaterializedCausalByteDataset,
     device: torch.device,
     model_seed: int,
+    effective_batch_size: int = canonical.DEFAULT_EFFECTIVE_BATCH_SIZE,
 ) -> tuple[int, list[dict[str, Any]]]:
-    candidates = (1, 2, 4, 8, 12, 16, 24, 32, 48, 64)
+    candidates = tuple(
+        candidate for candidate in AGGRESSIVE_BATCH_CANDIDATES if candidate <= effective_batch_size
+    )
+    if not candidates:
+        raise ValueError("effective_batch_size is below the smallest calibration candidate")
     reports = [
         canonical.benchmark_batch_size(settings, dataset, device, model_seed, candidate)
         for candidate in candidates
@@ -223,7 +251,11 @@ def _apply_profile(plan: SafeA100Plan):
     original_calibration = canonical.calibrate_batch_size
     canonical.model_settings = lambda: plan.model_settings
     if plan.profile == "aggressive":
-        canonical.calibrate_batch_size = _aggressive_calibrate_batch_size
+        canonical.calibrate_batch_size = (
+            lambda settings, dataset, device, model_seed: _aggressive_calibrate_batch_size(
+                settings, dataset, device, model_seed, plan.effective_batch_size
+            )
+        )
     try:
         yield
     finally:
@@ -415,6 +447,9 @@ def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, f
     parser.add_argument("--length-bucket-size", type=int, default=canonical.DEFAULT_LENGTH_BUCKET_SIZE)
     parser.add_argument("--expert-dispatch", choices=("loop", "segments"), default="loop")
     parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--effective-batch-size", type=int, default=canonical.DEFAULT_EFFECTIVE_BATCH_SIZE)
+    parser.add_argument("--learning-rate", type=float, default=canonical.DEFAULT_LEARNING_RATE)
+    parser.add_argument("--compile-forward", action="store_true")
     arguments = parser.parse_args(argv)
     results_directory = Path(arguments.results_dir).expanduser().resolve()
     if arguments.profile == "aggressive":
@@ -429,10 +464,13 @@ def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, f
         plan,
         batching=arguments.batching,
         length_bucket_size=arguments.length_bucket_size,
+        effective_batch_size=arguments.effective_batch_size,
+        learning_rate=arguments.learning_rate,
         model_settings=replace(
             plan.model_settings,
             expert_dispatch=arguments.expert_dispatch,
             activation_checkpointing=arguments.activation_checkpointing,
+            compile_forward=arguments.compile_forward,
         ),
     )
     return arguments.mode, plan, arguments.confirm_budget_hours

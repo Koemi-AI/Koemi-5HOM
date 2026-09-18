@@ -24,6 +24,7 @@ class ModelSettings:
     cache_capacity: int = 256
     scan_chunk: int = 128
     activation_checkpointing: bool = False
+    compile_forward: bool = False
     refine_decay_rate: float = 0.0625
     ablation: str = "no_refine"
 
@@ -52,6 +53,8 @@ class ModelSettings:
             raise ValueError("expert_dispatch must be loop or segments")
         if not isinstance(self.activation_checkpointing, bool):
             raise TypeError("activation_checkpointing must be a boolean")
+        if not isinstance(self.compile_forward, bool):
+            raise TypeError("compile_forward must be a boolean")
         if self.cache_capacity < 1:
             raise ValueError("cache_capacity must be at least 1")
         if not 0.0 < self.refine_decay_rate <= 1.0:

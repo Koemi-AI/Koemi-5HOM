@@ -37,8 +37,14 @@ from koemi.training.objective import calculate_training_objective, token_cross_e
 RUN_FORMAT_VERSION = 1
 CORPUS_FORMAT_VERSION = 1
 CHECKPOINT_FORMAT_VERSION = 1
-LEGACY_MODEL_SETTING_DEFAULTS: dict[str, Any] = {"expert_dispatch": "loop", "activation_checkpointing": False}
+LEGACY_MODEL_SETTING_DEFAULTS: dict[str, Any] = {
+    "expert_dispatch": "loop",
+    "activation_checkpointing": False,
+    "compile_forward": False,
+}
 LEGACY_BATCHING = "index"
+DEFAULT_EFFECTIVE_BATCH_SIZE = 64
+DEFAULT_LEARNING_RATE = 3e-4
 DEFAULT_LENGTH_BUCKET_SIZE = 64
 MINIMUM_A100_MEMORY_BYTES = 70 * 2**30
 CODE_SYSTEM_PROMPT = (
@@ -114,12 +120,18 @@ class RunConfiguration:
     evaluation_batches: int
     batching: str = LEGACY_BATCHING
     length_bucket_size: int = DEFAULT_LENGTH_BUCKET_SIZE
+    effective_batch_size: int = DEFAULT_EFFECTIVE_BATCH_SIZE
+    learning_rate: float = DEFAULT_LEARNING_RATE
 
     def __post_init__(self) -> None:
         if self.batching not in {"index", "length"}:
             raise ValueError("batching must be index or length")
         if self.length_bucket_size < 1:
             raise ValueError("length_bucket_size must be positive")
+        if isinstance(self.effective_batch_size, bool) or self.effective_batch_size < 1:
+            raise ValueError("effective_batch_size must be a positive integer")
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
+            raise ValueError("learning_rate must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -394,9 +406,9 @@ class RunningMetrics:
         self.answer_count += answer_mask.sum().detach()
         self.thinking_count += thinking_positions.sum().detach()
         self.valid_token_count += output.token_count
-        if output.active_expert_indices is not None:
-            assignments = output.active_expert_indices[output.valid_positions].reshape(-1)
-            self.expert_counts += torch.bincount(assignments, minlength=len(self.expert_counts))
+        totals = output.expert_activation_totals
+        if totals is not None:
+            self.expert_counts += totals
 
     def as_dict(self, elapsed_seconds: float) -> dict[str, Any]:
         supervised_count = int(self.supervised_count.item())
@@ -1269,7 +1281,9 @@ def evaluate(
             input_ids, target_ids, thinking_mask = move_batch(batch, device)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 output = model(input_ids, execution_mode=ExecutionMode.PARALLEL)
-                token_losses = token_cross_entropy(output.logits.float(), target_ids)
+                token_losses = calculate_training_objective(
+                    output, target_ids, thinking_mask, 0.5
+                ).token_loss
             if not bool(torch.isfinite(token_losses[target_ids != IGNORE_TARGET_ID]).all()):
                 raise FloatingPointError("non-finite validation token loss")
             metrics.add(output, token_losses, target_ids, thinking_mask)
@@ -1340,7 +1354,7 @@ def run_training(
             "corpus_sha256": corpus_manifest["sha256"],
             "model_settings": settings.to_dict(),
             "selected_batch_size": selected_batch_size,
-            "target_effective_batch_size": 64,
+            "target_effective_batch_size": configuration.effective_batch_size,
             "batch_calibration": calibration,
             "environment": dict(environment),
             "source_revisions": SOURCE_REVISIONS,
@@ -1359,7 +1373,7 @@ def run_training(
         "selected_batch_size": selected_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "thinking_loss_weight": 0.5,
-        "learning_rate": 3e-4,
+        "learning_rate": configuration.learning_rate,
         "weight_decay": 0.01,
         "warmup_steps": 1_000,
         "schedule_steps": 100_000,
@@ -1371,7 +1385,9 @@ def run_training(
     torch.cuda.manual_seed_all(configuration.model_seed)
     model = KoemiModel(settings).to(device)
     preflight_report = run_cuda_preflight(model, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=configuration.learning_rate, betas=(0.9, 0.95), weight_decay=0.01
+    )
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: schedule_lambda(step, 1_000, 100_000))
     scaler = torch.amp.GradScaler("cuda", enabled=False)
     checkpoint_result = checkpoint_store.load_latest()
@@ -1419,8 +1435,7 @@ def run_training(
             if not bool(torch.isfinite(objective.total_loss)):
                 raise FloatingPointError(f"non-finite training objective at optimizer step {optimizer_step + 1}")
             scaler.scale(scaled_loss).backward()
-            token_losses = token_cross_entropy(output.logits.float(), target_ids)
-            metrics.add(output, token_losses, target_ids, thinking_mask)
+            metrics.add(output, objective.token_loss.detach(), target_ids, thinking_mask)
             accumulated_batches += 1
             last_consumed_batch = absolute_batch_index + 1
             if accumulated_batches < gradient_accumulation_steps:

@@ -237,7 +237,7 @@ class MetricAccumulator:
         self.surprise_total = 0.0
         self.supervised_token_count = 0
         self.token_count = 0
-        self.expert_activation_counts: list[int] = []
+        self.expert_totals: Tensor | None = None
 
     def add(self, output: KoemiOutput, objective: TrainingObjective, supervised_count: int) -> None:
         self.weighted_loss += float(objective.total_loss.detach()) * supervised_count
@@ -246,13 +246,36 @@ class MetricAccumulator:
         self.surprise_total += float(output.surprise_values.masked_select(output.valid_positions).sum().detach())
         self.supervised_token_count += supervised_count
         self.token_count += output.token_count
-        self.accumulate_expert_activations(output.expert_activation_counts)
+        self.accumulate_expert_totals(output.expert_activation_totals)
+
+    def accumulate_expert_totals(self, totals: Tensor | None) -> None:
+        """Accumulate per-expert counts on the device the model ran on.
+
+        The totals stay a tensor until `expert_activation_counts` reads them, so a
+        training step never stalls on a per-expert host transfer.
+        """
+        if totals is None:
+            return
+        if self.expert_totals is None:
+            self.expert_totals = totals.clone()
+            return
+        if self.expert_totals.shape != totals.shape:
+            raise ValueError("expert activation totals changed width inside one accumulator")
+        self.expert_totals += totals
 
     def accumulate_expert_activations(self, counts: tuple[int, ...]) -> None:
-        if len(self.expert_activation_counts) < len(counts):
-            self.expert_activation_counts.extend([0] * (len(counts) - len(self.expert_activation_counts)))
-        for index, count in enumerate(counts):
-            self.expert_activation_counts[index] += count
+        if not counts:
+            return
+        totals = torch.tensor(counts, dtype=torch.long)
+        self.accumulate_expert_totals(
+            totals if self.expert_totals is None else totals.to(self.expert_totals.device)
+        )
+
+    @property
+    def expert_activation_counts(self) -> tuple[int, ...]:
+        if self.expert_totals is None:
+            return ()
+        return tuple(int(count) for count in self.expert_totals.tolist())
 
     def merge(self, other: MetricAccumulator) -> None:
         self.weighted_loss += other.weighted_loss
@@ -261,7 +284,7 @@ class MetricAccumulator:
         self.surprise_total += other.surprise_total
         self.supervised_token_count += other.supervised_token_count
         self.token_count += other.token_count
-        self.accumulate_expert_activations(tuple(other.expert_activation_counts))
+        self.accumulate_expert_totals(other.expert_totals)
 
     def average(self, weighted_value: float) -> float:
         return weighted_value / self.supervised_token_count if self.supervised_token_count else 0.0

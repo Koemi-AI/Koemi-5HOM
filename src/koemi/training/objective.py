@@ -15,6 +15,7 @@ class TrainingObjective:
     task_loss: Tensor
     thinking_loss: Tensor
     total_loss: Tensor
+    token_loss: Tensor
 
 
 def token_cross_entropy(logits: Tensor, target_ids: Tensor, label_smoothing: float = 0.0) -> Tensor:
@@ -60,4 +61,4 @@ def calculate_training_objective(
     if float(effective_weight.detach()) <= 0.0:
         raise ValueError("thinking_loss_weight removes every supervised target token")
     total_loss = (token_loss * weights * supervised_mask).sum() / effective_weight
-    return TrainingObjective(task_loss, thinking_loss, total_loss)
+    return TrainingObjective(task_loss, thinking_loss, total_loss, token_loss)
