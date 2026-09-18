@@ -27,6 +27,7 @@ from koemi.data.serialization import serialize_record
 from koemi.data.tokenizer import ByteTokenizer
 from koemi.model.execution import ExecutionMode
 from koemi.model.network import KoemiModel
+from koemi.training.batching_mode import BatchingMode
 from koemi.training.checkpoints import CheckpointStore
 from koemi.training.dataset import CausalByteDataset, IGNORE_TARGET_ID
 from koemi.training.generation import generate_text
@@ -36,6 +37,9 @@ from koemi.training.objective import calculate_training_objective, token_cross_e
 RUN_FORMAT_VERSION = 1
 CORPUS_FORMAT_VERSION = 1
 CHECKPOINT_FORMAT_VERSION = 1
+LEGACY_MODEL_SETTING_DEFAULTS: dict[str, Any] = {"expert_dispatch": "loop"}
+LEGACY_BATCHING = "index"
+DEFAULT_LENGTH_BUCKET_SIZE = 64
 MINIMUM_A100_MEMORY_BYTES = 70 * 2**30
 CODE_SYSTEM_PROMPT = (
     "You are a precise English software engineer. Diagnose errors, explain the cause, "
@@ -108,6 +112,14 @@ class RunConfiguration:
     checkpoint_interval_seconds: int
     log_interval_steps: int
     evaluation_batches: int
+    batching: str = LEGACY_BATCHING
+    length_bucket_size: int = DEFAULT_LENGTH_BUCKET_SIZE
+
+    def __post_init__(self) -> None:
+        if self.batching not in {"index", "length"}:
+            raise ValueError("batching must be index or length")
+        if self.length_bucket_size < 1:
+            raise ValueError("length_bucket_size must be positive")
 
 
 @dataclass(frozen=True)
@@ -154,6 +166,19 @@ class MaterializedCausalByteDataset(Dataset[tuple[bytes, bytes, bytes, bytes]]):
 
     def __len__(self) -> int:
         return len(self.record_indices)
+
+    def chunk_lengths(self) -> tuple[int, ...]:
+        """Return the real input length of every chunk, without reading the streams.
+
+        The length is what `__getitem__` yields for `input_ids`, so it is what
+        `collate_materialized_chunks` pads against.
+        """
+        lengths = []
+        for position in range(len(self.record_indices)):
+            offset = self.offsets[position]
+            stream_length = len(self.token_streams[self.record_indices[position]])
+            lengths.append(min(offset + self.sequence_length, stream_length - 1) - offset)
+        return tuple(lengths)
 
     def __getitem__(self, index: int) -> tuple[bytes, bytes, bytes, bytes]:
         stream_index = self.record_indices[index]
@@ -218,6 +243,57 @@ class DeterministicBatchSampler(Sampler[list[int]]):
         for batch_index in range(self.start_batch_index, self.batch_count):
             start_offset = batch_index * self.batch_size
             yield order[start_offset : start_offset + self.batch_size]
+
+    def __len__(self) -> int:
+        return self.batch_count - self.start_batch_index
+
+
+class LengthBucketedBatchSampler(Sampler[list[int]]):
+    """Group chunks of similar length so a batch pads against a short maximum.
+
+    `bucket_size` is the length interval a batch may not cross. Batches keep the
+    fixed `batch_size` of the index sampler, so the effective batch, the optimizer
+    schedule and `batch_count` stay comparable; only the membership changes. The
+    batch order is shuffled by `data_seed + epoch_index`, so the plan is
+    reproducible and `start_batch_index` addresses the same batch after a resume.
+    """
+
+    def __init__(
+        self,
+        chunk_lengths: Sequence[int],
+        batch_size: int,
+        data_seed: int,
+        epoch_index: int,
+        start_batch_index: int,
+        bucket_size: int = DEFAULT_LENGTH_BUCKET_SIZE,
+    ) -> None:
+        if len(chunk_lengths) < 1:
+            raise ValueError("dataset_length must be positive")
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        if bucket_size < 1:
+            raise ValueError("bucket_size must be positive")
+        self.batch_size = batch_size
+        self.data_seed = data_seed
+        self.epoch_index = epoch_index
+        self.start_batch_index = start_batch_index
+        self.bucket_size = bucket_size
+        plan = BatchingMode(
+            chunk_lengths,
+            max_batch_size=batch_size,
+            bucket_size=bucket_size,
+            preserve_order=False,
+            seed=data_seed + epoch_index,
+        )
+        self.batches = tuple(microbatch.sample_indices for microbatch in plan)
+        self.metrics = plan.metrics
+        self.batch_count = len(self.batches)
+        if not 0 <= start_batch_index <= self.batch_count:
+            raise ValueError("start_batch_index is outside this epoch")
+
+    def __iter__(self) -> Iterator[list[int]]:
+        for batch_index in range(self.start_batch_index, self.batch_count):
+            yield list(self.batches[batch_index])
 
     def __len__(self) -> int:
         return self.batch_count - self.start_batch_index
@@ -393,6 +469,43 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: source_file.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def run_model_settings_view(settings: ModelSettings) -> dict[str, Any]:
+    """Return the settings a run manifest and a run signature are compared on.
+
+    A setting added after a run started is dropped while it holds the value that
+    reproduces the behaviour of the run that wrote the manifest. Without that, a
+    new optional field would change `to_dict()`, fail the manifest comparison and
+    change the run signature, which would stop a paid session from resuming.
+    """
+    values = settings.to_dict()
+    for name, behaviour_preserving_default in LEGACY_MODEL_SETTING_DEFAULTS.items():
+        if values.get(name) == behaviour_preserving_default:
+            values.pop(name)
+    return values
+
+
+def normalize_manifest_model_settings(stored: Any) -> Any:
+    """Drop the settings a manifest written before them would not have carried."""
+    if not isinstance(stored, dict):
+        return stored
+    values = dict(stored)
+    for name, behaviour_preserving_default in LEGACY_MODEL_SETTING_DEFAULTS.items():
+        if values.get(name) == behaviour_preserving_default:
+            values.pop(name)
+    return values
+
+
+def run_batching_view(batching: str, bucket_size: int | None) -> dict[str, Any]:
+    """Return the batching fields a run manifest is compared on.
+
+    `index` reproduces the sampler every existing manifest was written under, so
+    it contributes nothing and an older manifest keeps resuming.
+    """
+    if batching == LEGACY_BATCHING:
+        return {}
+    return {"batching": batching, "length_bucket_size": bucket_size}
 
 
 def fingerprint(value: Mapping[str, Any]) -> str:
@@ -1038,8 +1151,19 @@ def create_loader(
     epoch_index: int,
     start_batch_index: int,
     num_workers: int,
+    batching: str = LEGACY_BATCHING,
+    bucket_size: int = DEFAULT_LENGTH_BUCKET_SIZE,
 ) -> DataLoader[dict[str, Tensor]]:
-    sampler = DeterministicBatchSampler(len(dataset), batch_size, data_seed, epoch_index, start_batch_index)
+    if batching not in {"index", "length"}:
+        raise ValueError("batching must be index or length")
+    if batching == "length":
+        sampler: Sampler[list[int]] = LengthBucketedBatchSampler(
+            dataset.chunk_lengths(), batch_size, data_seed, epoch_index, start_batch_index, bucket_size
+        )
+    else:
+        sampler = DeterministicBatchSampler(
+            len(dataset), batch_size, data_seed, epoch_index, start_batch_index
+        )
     options: dict[str, Any] = {}
     if num_workers > 0:
         options["prefetch_factor"] = 2
@@ -1195,8 +1319,14 @@ def run_training(
         run_manifest = read_json_object(run_manifest_path)
         if run_manifest.get("corpus_sha256") != corpus_manifest.get("sha256"):
             raise ValueError("run manifest corpus hash does not match the selected corpus")
-        if run_manifest.get("model_settings") != settings.to_dict():
+        if normalize_manifest_model_settings(run_manifest.get("model_settings")) != run_model_settings_view(settings):
             raise ValueError("run manifest model settings do not match")
+        stored_batching = run_manifest.get("batching", LEGACY_BATCHING)
+        if stored_batching != configuration.batching:
+            raise ValueError(
+                f"run manifest was written with batching '{stored_batching}' and this session requests "
+                f"'{configuration.batching}'; the batch plan would change under a resumed batch index"
+            )
         selected_batch_size = run_manifest.get("selected_batch_size")
         if not isinstance(selected_batch_size, int) or selected_batch_size < 1:
             raise ValueError("run manifest selected batch size is invalid")
@@ -1216,13 +1346,16 @@ def run_training(
             "source_revisions": SOURCE_REVISIONS,
             "sequence_length": configuration.sequence_length,
             "thinking_loss_weight": 0.5,
+            "batching": configuration.batching,
+            "length_bucket_size": configuration.length_bucket_size,
         }
         atomic_write_json(run_manifest_path, run_manifest)
     gradient_accumulation_steps = math.ceil(run_manifest["target_effective_batch_size"] / selected_batch_size)
     run_contract = {
         "run_format_version": RUN_FORMAT_VERSION,
         "corpus_sha256": corpus_manifest["sha256"],
-        "model_settings": settings.to_dict(),
+        "model_settings": run_model_settings_view(settings),
+        **run_batching_view(configuration.batching, configuration.length_bucket_size),
         "selected_batch_size": selected_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "thinking_loss_weight": 0.5,
@@ -1259,6 +1392,8 @@ def run_training(
             training_state["epoch_index"],
             training_state["next_batch_index"],
             configuration.num_workers,
+            configuration.batching,
+            configuration.length_bucket_size,
         )
         if len(loader) == 0:
             training_state["epoch_index"] += 1

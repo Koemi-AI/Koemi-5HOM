@@ -62,7 +62,12 @@ class KoemiModel(nn.Module):
         )
         self.fusion_projection = nn.Linear(embedding_size * 4, embedding_size)
         self.fusion_normalizer = RootMeanSquareNorm(embedding_size)
-        self.experts = DeterministicExpertMixture(embedding_size, settings.expert_count, settings.expert_top_k)
+        self.experts = DeterministicExpertMixture(
+            embedding_size,
+            settings.expert_count,
+            settings.expert_top_k,
+            settings.expert_dispatch,
+        )
         self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size)
 
     def forward(

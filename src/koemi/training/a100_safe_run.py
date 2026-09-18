@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import json
 import math
 from pathlib import Path
@@ -61,6 +61,8 @@ class SafeA100Plan:
     checkpoint_interval_minutes: int = DEFAULT_CHECKPOINT_MINUTES
     log_interval_steps: int = DEFAULT_LOG_INTERVAL_STEPS
     evaluation_batches: int = DEFAULT_EVALUATION_BATCHES
+    batching: str = canonical.LEGACY_BATCHING
+    length_bucket_size: int = canonical.DEFAULT_LENGTH_BUCKET_SIZE
     model_settings: canonical.ModelSettings | None = None
 
     def __post_init__(self) -> None:
@@ -68,6 +70,10 @@ class SafeA100Plan:
             raise TypeError("results_directory must be a Path")
         if self.profile not in {"safe", "aggressive"}:
             raise ValueError("profile must be safe or aggressive")
+        if self.batching not in {"index", "length"}:
+            raise ValueError("batching must be index or length")
+        if self.length_bucket_size < 1:
+            raise ValueError("length_bucket_size must be positive")
         if self.model_settings is None:
             object.__setattr__(self, "model_settings", canonical.model_settings())
         for value, name in (
@@ -136,6 +142,8 @@ class SafeA100Plan:
             "checkpoint_interval_minutes": self.checkpoint_interval_minutes,
             "log_interval_steps": self.log_interval_steps,
             "evaluation_batches": self.evaluation_batches,
+            "batching": self.batching,
+            "length_bucket_size": self.length_bucket_size,
             "model_settings": self.model_settings.to_dict(),
         }
 
@@ -180,6 +188,8 @@ def build_run_configuration(plan: SafeA100Plan) -> canonical.RunConfiguration:
         checkpoint_interval_seconds=plan.checkpoint_interval_minutes * 60,
         log_interval_steps=plan.log_interval_steps,
         evaluation_batches=plan.evaluation_batches,
+        batching=plan.batching,
+        length_bucket_size=plan.length_bucket_size,
     )
 
 
@@ -401,6 +411,9 @@ def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, f
     parser.add_argument("--budget-hours", type=float, default=DEFAULT_BUDGET_HOURS)
     parser.add_argument("--session-hours", type=float, default=DEFAULT_SESSION_HOURS)
     parser.add_argument("--confirm-budget-hours", type=float, default=None)
+    parser.add_argument("--batching", choices=("index", "length"), default=canonical.LEGACY_BATCHING)
+    parser.add_argument("--length-bucket-size", type=int, default=canonical.DEFAULT_LENGTH_BUCKET_SIZE)
+    parser.add_argument("--expert-dispatch", choices=("loop", "segments"), default="loop")
     arguments = parser.parse_args(argv)
     results_directory = Path(arguments.results_dir).expanduser().resolve()
     if arguments.profile == "aggressive":
@@ -411,6 +424,12 @@ def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, f
             budget_hours=arguments.budget_hours,
             session_hours=arguments.session_hours,
         )
+    plan = replace(
+        plan,
+        batching=arguments.batching,
+        length_bucket_size=arguments.length_bucket_size,
+        model_settings=replace(plan.model_settings, expert_dispatch=arguments.expert_dispatch),
+    )
     return arguments.mode, plan, arguments.confirm_budget_hours
 
 

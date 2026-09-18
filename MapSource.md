@@ -1,7 +1,7 @@
 ---
 prumo_protocol: "2.0.0"
 schema: 2
-updated_at: 2026-09-16
+updated_at: 2026-09-17
 ---
 
 # MapSource - Koemi-3HIP
@@ -1234,6 +1234,23 @@ already have allocated an over-budget tensor.
 - Proposed fix: evaluate exact detail-recall and cost against unchanged HERM
   before integrating the module or changing any default.
 
+### KOEMI-036 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `external A100 JSONL: optimizer_step 3060-3100` (user-provided)
+- Condition: adjacent training checkpoints oscillate in overall quality, while
+  the answer/thinking token mix changes from 25.3% to 39.4% thinking tokens.
+- Impact: selecting the step 3080 snapshot or claiming convergence from these
+  points can mistake batch composition noise for a training improvement.
+- Evidence: steps 3060, 3080 and 3100 report overall bpb 1.1090, 1.0021 and
+  1.1053; the first-to-last change is only -0.0037 bpb (-0.3%). The aggregate
+  over 73,250 supervised tokens is 1.0737 bpb, assuming the reported losses
+  share the same token denominator.
+- Proposed fix: evaluate a fixed validation stream at regular intervals and
+  retain rolling aggregates with separate answer and thinking denominators
+  before choosing checkpoints or reporting convergence.
+
 ## Resolved suspicions
 
 ### KOEMI-008 #risk/medium
@@ -1907,3 +1924,20 @@ already have allocated an over-budget tensor.
 - The preflight now instantiates `plan.model_settings`; a meta-device regression
   test asserts the aggressive profile has exactly 1,035,177,107 parameters.
   The corrected preflight must be rerun before any aggressive training.
+
+### 2026-09-17 - Aggressive A100 training checkpoints supplied by the user
+
+- Three adjacent JSON checkpoints cover optimizer steps 3060, 3080 and 3100.
+  They report 73,250 supervised tokens in total, with weighted overall loss
+  0.7442 nats / 1.0737 bpb, answer bpb 0.8919 and thinking bpb 1.4410.
+- Overall quality is not monotonic: step 3080 reaches 1.0021 bpb, but step
+  3100 returns to 1.1053 bpb. Answer bpb improves 4.2% from step 3060 to
+  3100, while the overall metric changes only 0.3%; this is not enough to
+  establish convergence without fixed validation data.
+- MoE dispatch remains broad and stable: all 128 experts are occupied, normalized
+  entropy is 0.9826-0.9831 and Gini is 0.2228-0.2279. It is not collapsed, but
+  the maximum load is about 2.4-2.5x the per-expert mean; these counts do not
+  prove semantic specialization because dispatch is deterministic.
+- Reported supervised throughput is 26,815.7-29,768.4 tokens/s and peak
+  allocated memory is about 31.3 GiB across the samples. These values are
+  user-provided remote-run evidence, not locally reproduced measurements.

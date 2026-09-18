@@ -20,6 +20,7 @@ class ModelSettings:
     salience_threshold: float = 0.75
     expert_count: int = 0
     expert_top_k: int = 1
+    expert_dispatch: str = "loop"
     cache_capacity: int = 256
     scan_chunk: int = 128
     refine_decay_rate: float = 0.0625
@@ -46,6 +47,8 @@ class ModelSettings:
             raise ValueError("expert_top_k must be at least 1")
         if self.expert_count > 0 and self.expert_top_k > self.expert_count:
             raise ValueError("expert_top_k must not exceed expert_count")
+        if self.expert_dispatch not in {"loop", "segments"}:
+            raise ValueError("expert_dispatch must be loop or segments")
         if self.cache_capacity < 1:
             raise ValueError("cache_capacity must be at least 1")
         if not 0.0 < self.refine_decay_rate <= 1.0:

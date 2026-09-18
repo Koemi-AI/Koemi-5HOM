@@ -45,12 +45,21 @@ class DeterministicExpertMixture(nn.Module):
     gradient contracts stay bit-exact until a profiled training kernel exists.
     """
 
-    def __init__(self, embedding_size: int, expert_count: int, top_k: int = 1) -> None:
+    def __init__(
+        self,
+        embedding_size: int,
+        expert_count: int,
+        top_k: int = 1,
+        dispatch: str = "loop",
+    ) -> None:
         super().__init__()
         self.expert_count = expert_count
         self.top_k = top_k
         if expert_count < 0 or top_k < 1 or (expert_count > 0 and top_k > expert_count):
             raise ValueError("top_k must be between one and expert_count")
+        if dispatch not in {"loop", "segments"}:
+            raise ValueError("dispatch must be loop or segments")
+        self.dispatch = dispatch
         self.experts = nn.ModuleList(GatedFeedForward(embedding_size) for _ in range(expert_count))
         self.output_normalizer = RootMeanSquareNorm(embedding_size)
         self._stacked_weights: StackedExpertWeights | None = None
@@ -89,7 +98,11 @@ class DeterministicExpertMixture(nn.Module):
             empty = torch.full_like(token_ids, UNASSIGNED_EXPERT)
             return context, empty, empty.unsqueeze(-1)
         assignments = self.assign_top_k(token_ids, previous_token_ids, valid_mask)
-        if self._requires_module_dispatch() or torch.is_grad_enabled():
+        if self._requires_module_dispatch():
+            return self._forward_with_module_dispatch(context, assignments, valid_mask)
+        if torch.is_grad_enabled():
+            if self.dispatch == "segments":
+                return self._forward_with_sorted_segments(context, assignments, valid_mask)
             return self._forward_with_module_dispatch(context, assignments, valid_mask)
         return self._forward_with_static_dispatch(context, assignments, valid_mask)
 
@@ -150,6 +163,53 @@ class DeterministicExpertMixture(nn.Module):
                 row_indices,
                 (expert_context / self.top_k).to(dtype=expert_updates.dtype),
             )
+        valid_rows = valid_mask.reshape(-1)
+        updated_context = self.output_normalizer(flattened_context + expert_updates)
+        mixed_context = torch.where(valid_rows.unsqueeze(-1), updated_context, flattened_context)
+        return mixed_context.reshape_as(context), assignments[:, :, 0], assignments
+
+    def _forward_with_sorted_segments(
+        self,
+        context: Tensor,
+        assignments: Tensor,
+        valid_mask: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        flattened_context = context.reshape(-1, context.shape[-1])
+        flattened_assignments = assignments.reshape(-1, self.top_k)
+        pair_count = flattened_assignments.numel()
+        device = flattened_context.device
+        pair_rows = torch.arange(flattened_context.shape[0], device=device).repeat_interleave(self.top_k)
+        pair_experts = flattened_assignments.reshape(-1)
+        pair_valid = (
+            pair_experts.ge(0)
+            & pair_experts.lt(self.expert_count)
+            & valid_mask.reshape(-1).repeat_interleave(self.top_k)
+            & self._first_assignment_occurrence(flattened_assignments).reshape(-1)
+        )
+        sortable_experts = torch.where(
+            pair_valid, pair_experts, pair_experts.new_full((), self.expert_count)
+        )
+        counts = torch.zeros(self.expert_count + 1, dtype=torch.long, device=device)
+        counts.scatter_add_(0, sortable_experts, torch.ones_like(sortable_experts))
+        order = torch.argsort(sortable_experts, stable=True)
+        sorted_rows = pair_rows.index_select(0, order)
+        sorted_context = flattened_context.index_select(0, sorted_rows)
+        segment_sizes = counts[: self.expert_count].tolist()
+        expert_updates = torch.zeros_like(flattened_context)
+        offset = 0
+        for expert_index, segment_size in enumerate(segment_sizes):
+            if segment_size == 0:
+                continue
+            end = offset + segment_size
+            expert_context = self.experts[expert_index](sorted_context[offset:end])
+            expert_updates.index_add_(
+                0,
+                sorted_rows[offset:end],
+                (expert_context / self.top_k).to(dtype=expert_updates.dtype),
+            )
+            offset = end
+        if offset > pair_count:
+            raise RuntimeError("sorted expert segments covered more pairs than the dispatch produced")
         valid_rows = valid_mask.reshape(-1)
         updated_context = self.output_normalizer(flattened_context + expert_updates)
         mixed_context = torch.where(valid_rows.unsqueeze(-1), updated_context, flattened_context)
