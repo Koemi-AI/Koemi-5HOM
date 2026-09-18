@@ -732,8 +732,13 @@ listed in that organization's pinned repositories, has Google-authored source
 and uses the Apache-2.0 license. It runs as a local MCP server/proxy and bridges
 a local agent to a Colab session in the browser over a localhost WebSocket. The
 upstream README lists Gemini CLI, Claude Code and Windsurf and requires
-`notifications/tools/list_changed`; compatibility with this Codex session is
-not verified and it is not currently connected here.
+`notifications/tools/list_changed`. On 2026-09-17, Codex CLI 0.154.0 was
+verified to support the same STDIO server through the global
+`[mcp_servers.colab-mcp]` entry in `%USERPROFILE%/.codex/config.toml`; `codex mcp
+list` reports it enabled. An already-running Codex session does not reload its
+tool catalog, so a new session/restart is required before the tool appears.
+The MCP server being enabled is separate from the browser bridge being open;
+no Colab notebook code was executed during setup.
 
 Rejected alternative: exposing a public notebook endpoint that evaluates
 arbitrary Python or shell commands. The official local bridge is the safer
