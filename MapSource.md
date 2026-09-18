@@ -1012,6 +1012,38 @@ Rejected alternative: shipping a transport with it. Deployment is on the
 out-of-scope list, so this is the engine and the network surface stays a separate
 decision.
 
+### D-043 - Serving reads the host once per step and prefills in length buckets
+
+Two costs the serving engine shipped with, both measured before either was
+touched.
+
+The decode step read one token per row from the device, so host reads tracked the
+batch exactly: 32 active rows cost 32 synchronizations per step, which threw away
+the sync-free property `BatchDecoder` exists for. The tokens are now concatenated
+and read with one `tolist`, and sampling is grouped so one call serves every row
+sharing a policy. Host reads are 1 per decode step at 1, 4, 16 and 32 rows.
+
+Rejected alternative: draining tokens every N steps. It would cut one read to
+1/N, but it delays every token by up to N-1 steps and lets a row that already hit
+its stop token keep emitting. That is a real latency-against-throughput trade and
+it needs a CUDA profile to judge; this host has none, so it was not taken.
+
+Prefill padded the whole admission to its longest prompt. The first note guessed
+12,5% from KOEMI-045; measured, it is 82,64%, because one 269-token prompt sets
+the width of thirty-one short ones. `_prefill_groups` splits an admission into
+length buckets and prefills each group inside the same `step`. Nothing waits for
+a partner, so time to first token is unchanged; only the padded width falls.
+Buckets of 16 take 8.608 padded tokens to 1.627, from 82,64% padding to 8,17%, at
+the cost of 9 forwards instead of 1.
+
+Bucket 16 is the default because it was the best of the three measured. The
+forward count against padded compute is the remaining lever and it needs a GPU to
+settle.
+
+The correctness bar for both is unchanged: every request still produces exactly
+the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1,
+4, 16, 32 and one group to prove the split is neutral.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
@@ -1314,22 +1346,6 @@ decision.
   atomic two-slot checkpoints, an A100 preflight and a measured batch calibration
   before the long loop. Keep `torch.compile` disabled until it proves equivalent
   and faster on this exact workload.
-
-### KOEMI-022 #risk/high
-
-- Severity: high
-- Status: closed
-- Location: `src/koemi/training/a100_run.py:596-660`, `notebooks/Koemi-3HIP_A100.ipynb`
-- Condition: Hugging Face source streams can repeat an upstream identifier, causing
-  corpus construction to abort after downloading data with `selected corpus contains
-  duplicate record identifiers`.
-- Impact: a Colab session spent on Hub downloads stopped before training and could
-  waste the user's bounded compute budget.
-- Evidence: the user's A100 notebook run reproduced the failure; the local duplicate
-  stream regression test now passes.
-- Proposed fix: reject duplicate identifiers while collecting each source, count the
-  rejection in the source report, and continue scanning until the quota is filled;
-  the embedded notebook runner is synchronized with the module.
 
 ### KOEMI-023 #risk/high
 
@@ -1758,28 +1774,6 @@ decision.
 - Proposed fix: rewrite the property over `torch.bincount` and return the counts
   as a tensor, letting the caller decide when to read them to the host.
 
-### KOEMI-049 #risk/medium
-
-- Severity: medium
-- Status: closed 2026-09-17
-- Location: `src/koemi/model/memory.py:read_window`
-- Condition: the sliding-window read built its scores from
-  `padded_keys.unfold(1, window, 1)`, and the einsum over that strided view
-  materialized a `[batch, length, width, window]` tile. It also normalized the
-  same key once per window it appeared in, which is `window` times of redundant
-  work.
-- Impact: measured with a saved-tensor probe at width 256, chunk 64, batch 2,
-  length 256, that tile held 80,00 MiB of 153,10 MiB of saved activations, 52,3%,
-  across three layouts. At the aggressive A100 profile one such tensor is 576,0
-  MiB in BF16.
-- Evidence: rewritten into the score form `[batch, length, carried + length]`,
-  which is the idiom `read_salient_window` already used. Saved activations fall
-  to 76,05 MiB, a 50,3% cut, and the isolated read measures 8,17x faster at width
-  256 and 15,35x at width 512, forward plus backward. Outputs agree with the
-  strided form to 1e-5 absolute; the difference is contraction order.
-- Proposed fix: closed. `tests/model/test_activation_memory.py` keeps the strided
-  form as the equivalence oracle.
-
 ### KOEMI-050 #risk/low
 
 - Severity: low
@@ -1831,36 +1825,6 @@ decision.
   Decide which of the two matters more only after a CUDA profile shows what the
   break actually costs.
 
-### KOEMI-053 #risk/medium
-
-- Severity: medium
-- Status: open, declared to the user
-- Location: `src/koemi/runtime/serving.py:_decode_once`
-- Condition: every decode step calls `int(sequence.next_token)` once per active
-  row to emit the token, which is one device-to-host read per row per step.
-- Impact: on CUDA that is `active_sequences` synchronizations per step, so the
-  engine loses the sync-free property `BatchDecoder` was built for. It is correct
-  but it caps throughput exactly where streaming matters.
-- Proposed fix: keep the emitted tokens on the device in a ring and drain them to
-  the host once per N steps, or hand the stream a device tensor and let the
-  consumer decide when to read. Measure on CUDA before choosing, because a
-  streaming API that batches its own reads adds latency to the first token.
-
-### KOEMI-054 #risk/low
-
-- Severity: low
-- Status: open, declared to the user
-- Location: `src/koemi/runtime/serving.py:_admit`
-- Condition: admissions are prefilled as one padded batch, left-padded to the
-  longest prompt in the admission group. A short prompt admitted next to a long
-  one pays the long one's width.
-- Impact: wasted prefill compute proportional to the spread of prompt lengths in
-  one admission, the same effect KOEMI-045 measured at 12,5% for training.
-- Proposed fix: reuse `LengthBucketedBatchSampler`'s idea at the admission
-  boundary, or admit in length buckets across several steps. Measure first: unlike
-  training, a serving admission is latency-sensitive and holding a short prompt
-  back to find a partner costs time to first token.
-
 ### KOEMI-048 #risk/high
 
 - Severity: high
@@ -1885,6 +1849,100 @@ decision.
   raise the active fraction and make decode amortizable.
 
 ## Resolved suspicions
+
+### KOEMI-022 #risk/high
+
+- Severity: high
+- Status: closed
+- Location: `src/koemi/training/a100_run.py:596-660`, `notebooks/Koemi-3HIP_A100.ipynb`
+- Condition: Hugging Face source streams can repeat an upstream identifier, causing
+  corpus construction to abort after downloading data with `selected corpus contains
+  duplicate record identifiers`.
+- Impact: a Colab session spent on Hub downloads stopped before training and could
+  waste the user's bounded compute budget.
+- Evidence: the user's A100 notebook run reproduced the failure; the local duplicate
+  stream regression test now passes.
+- Proposed fix: reject duplicate identifiers while collecting each source, count the
+  rejection in the source report, and continue scanning until the quota is filled;
+  the embedded notebook runner is synchronized with the module.
+- Closed before this session: the entry already recorded the regression test
+  passing and the fix in place, but it never left the live zone. Moved
+  2026-09-17 with its text unchanged.
+
+### KOEMI-049 #risk/medium
+
+- Severity: medium
+- Status: closed
+- Location: `src/koemi/model/memory.py:read_window`
+- Condition: the sliding-window read built its scores from
+  `padded_keys.unfold(1, window, 1)`, and the einsum over that strided view
+  materialized a `[batch, length, width, window]` tile. It also normalized the
+  same key once per window it appeared in, which is `window` times of redundant
+  work.
+- Impact: measured with a saved-tensor probe at width 256, chunk 64, batch 2,
+  length 256, that tile held 80,00 MiB of 153,10 MiB of saved activations, 52,3%,
+  across three layouts. At the aggressive A100 profile one such tensor is 576,0
+  MiB in BF16.
+- Evidence: rewritten into the score form `[batch, length, carried + length]`,
+  which is the idiom `read_salient_window` already used. Saved activations fall
+  to 76,05 MiB, a 50,3% cut, and the isolated read measures 8,17x faster at width
+  256 and 15,35x at width 512, forward plus backward. Outputs agree with the
+  strided form to 1e-5 absolute; the difference is contraction order.
+- Proposed fix: closed. `tests/model/test_activation_memory.py` keeps the strided
+  form as the equivalence oracle.
+- Closed 2026-09-17 by commit `4f25671`: `read_window` moved to the score form,
+  which removed the `[batch, length, width, window]` tile.
+
+### KOEMI-053 #risk/medium
+
+- Severity: medium
+- Status: closed
+- Location: `src/koemi/runtime/serving.py:_decode_once`
+- Condition: every decode step called `int(sequence.next_token)` once per active
+  row, which is one device-to-host read per row per step.
+- Impact: measured with a probe over `Tensor.__int__`, `Tensor.item` and
+  `Tensor.tolist`, host reads tracked the batch exactly: 1 row gave 1 read, 4
+  gave 4, 16 gave 16 and 32 gave 32.
+- Evidence: the tokens are now concatenated once and read with one `tolist`, and
+  sampling is grouped so one call serves every row sharing a policy. The same
+  probe now measures 1 read per decode step at 1, 4, 16 and 32 rows.
+  `test_a_decode_step_reads_the_host_once_whatever_the_width` pins it.
+- Proposed fix: closed without the latency trade the first note proposed. Draining
+  every N steps would cut 1 read to 1/N, but it delays every token by up to N-1
+  steps and lets a stopped row emit past its stop token. That trade needs a CUDA
+  profile to judge and this host has none, so it was not taken.
+- Closed 2026-09-17 by commit `418c1f7`: one `tolist` per decode step, with
+  sampling grouped by policy.
+
+### KOEMI-054 #risk/medium
+
+- Severity: medium, recorded as low until it was measured
+- Status: closed
+- Location: `src/koemi/runtime/serving.py:_admit`
+- Condition: admissions were prefilled as one padded batch, left-padded to the
+  longest prompt in the group, so one long prompt set the width of every short one
+  beside it.
+- Impact: far worse than the 12,5% this note first guessed from KOEMI-045.
+  Measured inside the engine over 32 prompts drawn lognormal, lengths 3 to 269 and
+  mean 46,7: one group prefilled 8.608 padded tokens for 1.494 real ones, which is
+  82,64% padding.
+- Evidence: `_prefill_groups` splits an admission into length buckets and prefills
+  every group inside the same `step`, so nothing waits for a partner and time to
+  first token is unchanged. Measured on the same 32 prompts:
+
+  | bucket | forwards | padded tokens | padding |
+  |---|---|---|---|
+  | none | 1 | 8.608 | 82,64% |
+  | 64 | 4 | 2.537 | 41,11% |
+  | 32 | 6 | 1.909 | 21,74% |
+  | 16 | 9 | 1.627 | 8,17% |
+
+  16 is the default. `test_bucketing_does_not_change_a_single_token` checks bucket
+  sizes 1, 4, 16, 32 and one group all against the single-stream oracle.
+- Proposed fix: closed. The remaining lever is the forward count, 9 against 1,
+  which trades launches for padded compute; judging that needs a CUDA profile.
+- Closed 2026-09-17 by commit `418c1f7`: `_prefill_groups` buckets an admission
+  by length and prefills every group inside one step.
 
 ### KOEMI-008 #risk/medium
 
