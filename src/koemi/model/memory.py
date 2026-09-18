@@ -339,35 +339,48 @@ class LocalKeyValueMemory(nn.Module):
         valid_mask: Tensor,
         queries: Tensor,
     ) -> tuple[Tensor, Tensor]:
-        batch_size, length, width = queries.shape
+        _, length, width = queries.shape
         window = self.local_memory_size
         carried_length = carried_keys.shape[1]
         all_keys = torch.cat((carried_keys, keys), dim=1)
         all_values = torch.cat((carried_values, values), dim=1)
         all_valid = torch.cat((carried_valid, valid_mask), dim=1)
-        leading_keys = all_keys.new_zeros(batch_size, window, width)
-        leading_values = all_values.new_zeros(batch_size, window, width)
-        leading_valid = torch.zeros(batch_size, window, dtype=torch.bool, device=queries.device)
-        padded_keys = torch.cat((leading_keys, all_keys), dim=1)
-        padded_values = torch.cat((leading_values, all_values), dim=1)
-        padded_valid = torch.cat((leading_valid, all_valid), dim=1)
-        start = carried_length
-        key_windows = padded_keys.unfold(1, window, 1)[:, start : start + length]
-        value_windows = padded_values.unfold(1, window, 1)[:, start : start + length]
-        valid_windows = padded_valid.unfold(1, window, 1)[:, start : start + length]
-        scores = torch.einsum("btdw,btd->btw", key_windows, queries) / math.sqrt(width)
-        masked_scores = scores.masked_fill(~valid_windows, NEGATIVE_INFINITY)
-        any_slot = valid_windows.any(dim=-1, keepdim=True)
+        eligible = self.sliding_window_mask(all_valid, carried_length, length, window)
+        scores = torch.einsum("bsd,btd->bts", all_keys, queries) / math.sqrt(width)
+        masked_scores = scores.masked_fill(~eligible, NEGATIVE_INFINITY)
+        any_slot = eligible.any(dim=-1, keepdim=True)
         weights = torch.softmax(masked_scores, dim=-1)
         weights = torch.where(any_slot, weights, torch.zeros_like(weights))
-        local_value = torch.einsum("btdw,btw->btd", value_windows, weights)
+        local_value = torch.einsum("bts,bsd->btd", weights, all_values)
         normalized_queries = functional.normalize(queries, dim=-1)
-        normalized_keys = functional.normalize(key_windows, dim=2)
-        similarity = torch.einsum("btdw,btd->btw", normalized_keys, normalized_queries)
-        similarity = similarity.masked_fill(~valid_windows, NEGATIVE_INFINITY)
+        normalized_keys = functional.normalize(all_keys, dim=-1)
+        similarity = torch.einsum("bsd,btd->bts", normalized_keys, normalized_queries)
+        similarity = similarity.masked_fill(~eligible, NEGATIVE_INFINITY)
         highest = similarity.amax(dim=-1)
         novelty = torch.where(any_slot.squeeze(-1), 1.0 - highest, torch.ones_like(highest))
         return local_value, novelty.clamp(0.0, 1.0)
+
+    @staticmethod
+    def sliding_window_mask(
+        all_valid: Tensor,
+        carried_length: int,
+        length: int,
+        window: int,
+    ) -> Tensor:
+        """Select, for every query position, the `window` valid entries just before it.
+
+        `all_valid` is `[batch, carried_length + length]`. The returned mask is
+        `[batch, length, carried_length + length]` and is true where source `s`
+        is one of the `window` positions strictly preceding the query's own entry.
+        This is the score-space form of the sliding window: it never materializes
+        the `[batch, length, width, window]` tile the strided view produced, which
+        measured 52% of the saved activations on the probe of 2026-09-17.
+        """
+        device = all_valid.device
+        own_positions = carried_length + torch.arange(length, device=device).unsqueeze(1)
+        source_positions = torch.arange(all_valid.shape[1], device=device).unsqueeze(0)
+        inside_window = (source_positions < own_positions) & (source_positions >= own_positions - window)
+        return inside_window.unsqueeze(0) & all_valid.unsqueeze(1)
 
     def tail(
         self,

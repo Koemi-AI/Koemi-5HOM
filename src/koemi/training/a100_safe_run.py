@@ -414,6 +414,7 @@ def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, f
     parser.add_argument("--batching", choices=("index", "length"), default=canonical.LEGACY_BATCHING)
     parser.add_argument("--length-bucket-size", type=int, default=canonical.DEFAULT_LENGTH_BUCKET_SIZE)
     parser.add_argument("--expert-dispatch", choices=("loop", "segments"), default="loop")
+    parser.add_argument("--activation-checkpointing", action="store_true")
     arguments = parser.parse_args(argv)
     results_directory = Path(arguments.results_dir).expanduser().resolve()
     if arguments.profile == "aggressive":
@@ -428,7 +429,11 @@ def parse_arguments(argv: list[str] | None = None) -> tuple[str, SafeA100Plan, f
         plan,
         batching=arguments.batching,
         length_bucket_size=arguments.length_bucket_size,
-        model_settings=replace(plan.model_settings, expert_dispatch=arguments.expert_dispatch),
+        model_settings=replace(
+            plan.model_settings,
+            expert_dispatch=arguments.expert_dispatch,
+            activation_checkpointing=arguments.activation_checkpointing,
+        ),
     )
     return arguments.mode, plan, arguments.confirm_budget_hours
 

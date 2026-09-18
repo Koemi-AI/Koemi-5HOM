@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor, nn
 from torch.nn import functional
+from torch.utils.checkpoint import checkpoint
 
 from koemi.configuration.settings import ModelSettings, PAD_TOKEN_ID
 from koemi.model.cache import CachedMapping, DiskMappingCache, WarmTokenCache
@@ -19,7 +20,7 @@ from koemi.model.memory import (
     MemoryWriteTerms,
 )
 from koemi.model.scan import affine_scan, previous_states
-from koemi.model.state import KoemiState
+from koemi.model.state import KOEMI_STATE_FIELDS, KoemiState
 
 
 @dataclass(frozen=True)
@@ -143,10 +144,10 @@ class KoemiModel(nn.Module):
         current_state = state or self.initial_state(batch_size, input_ids.device)
         window = self.settings.scan_chunk
         if window >= length:
-            return self.forward_window(input_ids, current_state, warm_cache, trusted_inputs=trusted_inputs)
+            return self.run_window(input_ids, current_state, warm_cache, trusted_inputs=trusted_inputs)
         windows: list[KoemiOutput] = []
         for start in range(0, length, window):
-            piece = self.forward_window(
+            piece = self.run_window(
                 input_ids[:, start : start + window],
                 current_state,
                 warm_cache,
@@ -155,6 +156,80 @@ class KoemiModel(nn.Module):
             windows.append(piece)
             current_state = piece.state
         return concatenate_outputs(windows)
+
+    def run_window(
+        self,
+        input_ids: Tensor,
+        current_state: KoemiState,
+        warm_cache: WarmTokenCache | None,
+        *,
+        trusted_inputs: bool = False,
+    ) -> KoemiOutput:
+        """Run one scan window, recomputing it during backward when asked.
+
+        Checkpointing applies only while training with gradients enabled. The
+        inference caches are rejected in training mode, so a recomputed window can
+        never double-count a cache hit.
+        """
+        if not (self.settings.activation_checkpointing and self.training and torch.is_grad_enabled()):
+            return self.forward_window(input_ids, current_state, warm_cache, trusted_inputs=trusted_inputs)
+        return self.checkpointed_window(input_ids, current_state, trusted_inputs=trusted_inputs)
+
+    def checkpointed_window(
+        self,
+        input_ids: Tensor,
+        current_state: KoemiState,
+        *,
+        trusted_inputs: bool,
+    ) -> KoemiOutput:
+        counters: dict[str, int] = {}
+        step_index = current_state.step_index
+
+        def run(window_ids: Tensor, *state_tensors: Tensor) -> tuple[Tensor, ...]:
+            window_state = KoemiState(*state_tensors, step_index=step_index)
+            output = self.forward_window(window_ids, window_state, None, trusted_inputs=trusted_inputs)
+            counters["token_count"] = output.token_count
+            counters["cache_hits"] = output.cache_hits
+            counters["cache_misses"] = output.cache_misses
+            counters["expert_count"] = output.expert_count
+            counters["has_active_expert_indices"] = int(output.active_expert_indices is not None)
+            active = (
+                output.active_expert_indices
+                if output.active_expert_indices is not None
+                else output.expert_indices.unsqueeze(-1)
+            )
+            return (
+                output.logits,
+                output.surprise_values,
+                output.expert_indices,
+                output.valid_positions,
+                active,
+                *(getattr(output.state, field_name) for field_name in KOEMI_STATE_FIELDS),
+            )
+
+        results = checkpoint(
+            run,
+            input_ids,
+            *(getattr(current_state, field_name) for field_name in KOEMI_STATE_FIELDS),
+            use_reentrant=False,
+        )
+        logits, surprise_values, expert_indices, valid_positions, active = results[:5]
+        next_state = KoemiState(
+            *results[5:],
+            step_index=step_index + input_ids.shape[1],
+        )
+        return KoemiOutput(
+            logits=logits,
+            state=next_state,
+            surprise_values=surprise_values,
+            expert_indices=expert_indices,
+            valid_positions=valid_positions,
+            token_count=counters["token_count"],
+            cache_hits=counters["cache_hits"],
+            cache_misses=counters["cache_misses"],
+            expert_count=counters["expert_count"],
+            active_expert_indices=active if counters["has_active_expert_indices"] else None,
+        )
 
     def forward_window(
         self,

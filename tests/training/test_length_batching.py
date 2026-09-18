@@ -8,6 +8,7 @@ from koemi.data.contracts import DatasetRecord
 from koemi.training.a100_run import (
     DEFAULT_LENGTH_BUCKET_SIZE,
     LEGACY_BATCHING,
+    LEGACY_MODEL_SETTING_DEFAULTS,
     DeterministicBatchSampler,
     LengthBucketedBatchSampler,
     MaterializedCausalByteDataset,
@@ -127,7 +128,8 @@ class LoaderSelectionTest(unittest.TestCase):
 class ResumeCompatibilityTest(unittest.TestCase):
     def legacy_settings_dict(self) -> dict:
         values = ModelSettings(expert_count=8, expert_top_k=3).to_dict()
-        values.pop("expert_dispatch")
+        for name in LEGACY_MODEL_SETTING_DEFAULTS:
+            values.pop(name)
         return values
 
     def test_a_manifest_written_before_expert_dispatch_still_matches(self) -> None:

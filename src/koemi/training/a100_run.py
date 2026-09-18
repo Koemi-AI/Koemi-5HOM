@@ -37,7 +37,7 @@ from koemi.training.objective import calculate_training_objective, token_cross_e
 RUN_FORMAT_VERSION = 1
 CORPUS_FORMAT_VERSION = 1
 CHECKPOINT_FORMAT_VERSION = 1
-LEGACY_MODEL_SETTING_DEFAULTS: dict[str, Any] = {"expert_dispatch": "loop"}
+LEGACY_MODEL_SETTING_DEFAULTS: dict[str, Any] = {"expert_dispatch": "loop", "activation_checkpointing": False}
 LEGACY_BATCHING = "index"
 DEFAULT_LENGTH_BUCKET_SIZE = 64
 MINIMUM_A100_MEMORY_BYTES = 70 * 2**30
