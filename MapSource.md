@@ -1,7 +1,7 @@
 ---
 prumo_protocol: "2.0.0"
 schema: 2
-updated_at: 2026-09-17
+updated_at: 2026-09-18
 ---
 
 # MapSource - Koemi-3HIP
@@ -2734,6 +2734,71 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   hierarchy, LRU/prefetch and expert union; it is a reference only. No Koemi
   performance claim is derived from it.
 
+### 2026-09-17 - Isolated native CUDA kernel fronts
+
+- Spawned four disjoint fronts for core fused operations, dense/HERM affine
+  scan, causal think/surprise, and MoE/Submapping routing and grouped MLP.
+- Added opt-in native `.cu`/binding slices under
+  `src/koemi/cuda_kernels/` with conditional contract tests under
+  `tests/cuda/`; the existing runner and default model paths remain unchanged.
+- Reproduced and fixed a dense broadcast-backward shape bug: a `[2, 3, 4]`
+  gradient reduced to `[2, 3]` now returns the expected shape and value, with
+  a regression test.
+- Verification on the current host: `.koemi-venv\Scripts\python.exe -m
+  unittest discover -s tests/cuda -p 'test_*.py'` passed 32 tests with 18
+  conditional skips; `compileall -q src/koemi/cuda_kernels tests/cuda` and
+  `git diff --check` passed. The full suite also passed 548 tests with 16
+  conditional skips.
+- Not verified: native `.cu` compilation, GPU execution, CUDA equivalence,
+  gradients on GPU, benchmark or speedup. The host has PyTorch
+  `2.14.0+cpu`, no CUDA device, no `nvcc` and no `nvidia-smi`. A persistent
+  FastMCP probe did enumerate the dynamic notebook tools (`get_cells`, cell
+  editing and `run_code_cell`), and the execution probe ran the harness in the
+  connected notebook. Its remote preflight reported PyTorch `2.11.0+cpu`,
+  `torch.version.cuda=None`, `cuda_available=False` and zero devices, so the
+  harness skipped compilation and benchmark; no GPU credit was consumed.
+- The MoE slice is inference-only at this stage and is not connected to the
+  normal runner. No performance claim is made.
+
+### 2026-09-18 - A100 native CUDA verification and MCP retryer
+
+- The retrying Colab launcher reconnects a fresh STDIO MCP client after a
+  browser-bridge/runtime transition, waits for the dynamic notebook tools and
+  retries with bounded exponential backoff. It exposes `KOEMI_MCP_RETRIES`,
+  `KOEMI_MCP_RETRY_DELAY` and `KOEMI_MCP_RETRY_MAX_DELAY`; remote cell failures
+  are reported as harness failures instead of being mistaken for disconnects.
+- The connected runtime was verified as `NVIDIA A100-SXM4-40GB`, compute
+  capability `8.0`, PyTorch `2.11.0+cu128`, CUDA `12.8`, one device. The
+  harness installed the missing Colab build dependency `ninja` and compiled
+  core, dense, think and MoE extensions from the local `.cu/.cpp` payloads.
+- Remote forward/backward equivalence and contract checks passed for core
+  RMSNorm+SiLU, dense affine scan, causal surprise and MoE route/permute/
+  grouped-MLP/combine. All four `KOEMI_COMPILED` and four `KOEMI_PASS` markers
+  were observed, followed by `KOEMI_REMOTE_DONE` on the A100.
+- Measured CUDA-event microbenchmarks: core native `0.01321 ms` versus the
+  PyTorch reference `0.09277 ms` (ratio `0.1424`); dense native `0.06339 ms`
+  versus the Python sequential reference `8.74465 ms` (ratio `0.00725`);
+  think native `0.78049 ms` versus the PyTorch reference `0.45967 ms` (ratio
+  `1.6979`, slower for that shape). These are operator microbenchmarks, not
+  end-to-end training or serving claims.
+- Portability fixes made after deterministic A100 compiler failures: think
+  uses `<cfloat>`/`FLT_MAX` instead of the unavailable `CUDART_INF_F`, MoE
+  histogram counting uses the CUDA-supported 64-bit atomic form, and the
+  remote build creates each extension directory before acquiring its lock.
+
+### Open risks introduced by the A100 verification
+
+- KOEMI-059 - `src/koemi/cuda_kernels/think/surprise_kernel.cu:1-250` -
+  condition: the measured think kernel is `1.6979x` the PyTorch reference
+  latency for the tested `4x64x1024x128` shape; impact: the native kernel is
+  not a universal acceleration and needs a profile-guided redesign before
+  default integration; severity: medium; status: open.
+- KOEMI-060 - `.colab_run_existing.py:60-90` - condition: the retry harness
+  installs an unpinned `ninja` package from PyPI when the ephemeral Colab
+  runtime lacks it; impact: remote build reproducibility and supply-chain
+  provenance are weaker than a pinned, prebuilt environment; severity: low;
+  status: open.
+
 ### Open risks introduced by this block
 
 - KOEMI-051 - `src/koemi/runtime/moe_submapping.py:320-439` - condition: the
@@ -2757,3 +2822,19 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   impact: current runner semantics can reduce valid `k` silently; the isolated
   fork rejects this condition and leaves the legacy path unchanged; severity:
   high; status: open.
+- KOEMI-056 - `src/koemi/cuda_kernels/**` - condition: all four native slices
+  now compile and pass the remote forward/backward or contract checks on the
+  A100, but the harness is not an end-to-end model run and the local host is
+  still CPU-only; impact: integration behavior, larger-shape coverage and
+  production acceleration remain unproven; severity: medium; status:
+  mitigated.
+- KOEMI-057 - `src/koemi/cuda_kernels/moe/**` - condition: the isolated MoE
+  implementation has no backward path and is not integrated with a runner;
+  impact: it does not yet cover MoE training or end-to-end inference;
+  severity: high; status: open.
+- KOEMI-058 - Colab MCP browser bridge - condition: the main Codex client does
+  not consume dynamic tool-list updates, so the retrying external FastMCP
+  launcher remains necessary; impact: a direct tool call in this client is not
+  the supported execution path, although the retryer now reconnects after a
+  runtime switch and verified the A100 run; severity: medium; status:
+  mitigated.
