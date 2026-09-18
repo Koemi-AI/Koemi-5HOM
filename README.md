@@ -1,12 +1,18 @@
-# Koemi-3HIP
+# Koemi-4HCM
 
-Koemi-3HIP (Koemi-3 HERM Initial Phase) is a PyTorch training base for byte-level causal models built on
+Koemi-4HCM (Koemi-4 HERM Consolidation Model) is the consolidation release of
+the Koemi training base for byte-level causal models built on
 HERM (Hierarchical Error-Refined Memory): bounded recurrent state, rank-one
 associative memory, exact recent and salient recall, and optional deterministic
 experts. The slower refine tier is opt-in.
 
 This repository contains architecture and training code. It does not ship a
 trained model and does not claim Transformer-level quality.
+
+The release map, measured A100 operator results and the boundary between source,
+weights and training data are in [`docs/KOEMI_4HCM_RELEASE.md`](docs/KOEMI_4HCM_RELEASE.md).
+The 3HIP name remains in historical notebooks, assets and benchmark records for
+compatibility and provenance.
 
 ## Problem
 
@@ -72,7 +78,7 @@ verification.
 ```bash
 .venv/bin/python -m koemi train \
   --dataset examples/canonical.jsonl \
-  --checkpoint artifacts/koemi-3hip.pt \
+  --checkpoint artifacts/koemi-4hcm.pt \
   --overwrite \
   --expert-count 2 \
   --thinking-loss-weight 2.0
@@ -91,7 +97,7 @@ them the original DataLoader order and batching path remain in place.
 
 ```bash
 .venv/bin/python -m koemi generate \
-  --checkpoint artifacts/koemi-3hip.pt \
+  --checkpoint artifacts/koemi-4hcm.pt \
   --system "Answer in one sentence." \
   --prompt "Explain FIFO." \
   --max-new-bytes 64 \
@@ -140,10 +146,10 @@ counters are logged as block probes, not as a claim about request-level speed.
 Three decode paths exist, and `generate` picks one. The default is unchanged.
 
 ```bash
-.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-3hip.pt \
+.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-4hcm.pt \
   --prompt "Explain FIFO." --max-new-bytes 256 --fast-decode --greedy
 
-.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-3hip.pt \
+.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-4hcm.pt \
   --prompt "Explain FIFO." --max-new-bytes 256 --ngram-draft --draft-length 4
 ```
 
@@ -193,7 +199,7 @@ An existing byte checkpoint migrates instead of being discarded:
 
 ```bash
 .venv/bin/python -m koemi expand-vocabulary \
-  --checkpoint artifacts/koemi-3hip.pt \
+  --checkpoint artifacts/koemi-4hcm.pt \
   --vocabulary artifacts/vocabulary.json \
   --output artifacts/koemi-hybrid.pt
 ```
@@ -282,11 +288,11 @@ These figures are deliberately operational: each box names a component that
 exists in this repository, and every claim is bounded by the tests and
 measurements documented below.
 
-![Koemi-3HIP HERM ecosystem overview](assets/koemi-3hip-herm-ecosystem.png)
+![Koemi-4HCM HERM ecosystem overview](assets/koemi-3hip-herm-ecosystem.png)
 
 ![HERM memory hierarchy and equations](assets/herm-memory-hierarchy.png)
 
-![Koemi-3HIP runtime and prefix reuse](assets/koemi-3hip-runtime.png)
+![Koemi-4HCM runtime and prefix reuse](assets/koemi-3hip-runtime.png)
 
 ![Current limits and validation plan](assets/koemi-3hip-limits.png)
 
@@ -413,8 +419,9 @@ available, perplexity, learning rate, optimizer steps, precision and tokens/s.
 
 ### Hardware, RAM and SSD responsibilities
 
-- CPU/GPU tensors execute the model. The CPU path is the currently measured path;
-  CUDA and AMP are supported by configuration but require a CUDA host for proof.
+- CPU/GPU tensors execute the model. The CPU path remains the locally measured
+  oracle; four opt-in native CUDA operator slices have separate A100 evidence,
+  but the default runner and end-to-end training path are not promoted to them.
 - RAM holds active parameters and the fixed-width `KoemiState`. A state does not
   grow with conversation length.
 - The RAM warm cache stores detached embeddings by token id. It is disabled in
@@ -428,12 +435,13 @@ available, perplexity, learning rate, optimizer steps, precision and tokens/s.
 
 ### What Koemi is — and is not
 
-Koemi-3HIP is an ambitious research implementation with executable contracts,
+Koemi-4HCM is an ambitious research implementation with executable contracts,
 not a Transformer replacement today. It currently provides a bounded causal
 state, associative and exact memory paths, deterministic runtime behavior,
-prefix reuse and reproducible CPU measurements. It does not yet establish
-Transformer-level quality, arbitrary long-context recall, CUDA/FP16 speed, or a
-quality gain from salience. Those are explicit experiments, not implied claims.
+prefix reuse, reproducible CPU measurements and measured native CUDA operator
+slices. It does not yet establish Transformer-level quality, arbitrary
+long-context recall, end-to-end CUDA/FP16 speed, or a quality gain from
+salience. Those are explicit experiments, not implied claims.
 
 For positive features `phi`, the fast tier computes an epsilon-regularized read
 and multiplies it by
@@ -490,14 +498,15 @@ selects it:
 
 | Front | Current contract | Boundary |
 | --- | --- | --- |
-| CUDA and state | CUDA affine-scan backend, reusable state buffers, AMP/TF32 policy | PyTorch CUDA ops are implemented; no native `.cu` kernel or local CUDA timing |
+| CUDA and state | CUDA affine-scan backend, reusable state buffers, AMP/TF32 policy | Native `.cu` fronts exist for core, dense, think and MoE; they are opt-in and have operator-level A100 evidence only |
+| Native CUDA slices | `src/koemi/cuda_kernels/` with `tests/cuda/` | Core, dense and think have A100 microbenchmarks; MoE has contract evidence without end-to-end throughput |
 | Context | Multi-rate summary, exact prefix index, causal bounded admission | Summary is lossy; exact stores never perform semantic reuse |
 | Batching and bulk | Length-aware training sampler, prefill/decode APIs, inference scheduler, exact RAM/SSD blocks, `BulkPrefixCache`, bounded async enqueue | Bulk and scheduling remain opt-in; scheduler execution remains caller-owned; no end-to-end throughput claim |
 
 The local verification is CPU-only: the complete suite passes with conditional
-CUDA skips. This front records contracts and measurements to collect; it does
-not claim that a GPU, CPU thread, RAM cache or SSD will overlap usefully for
-every workload.
+CUDA skips. A separate A100 harness compiled and contract-checked the native
+extensions, and measured selected operator shapes. This does not claim that a
+GPU, CPU thread, RAM cache or SSD will overlap usefully for every workload.
 
 ## Parameter offload
 
@@ -613,7 +622,7 @@ model speculation; the CUDA graph path is added only when CUDA is present.
 
 ```bash
 .venv/bin/python benchmarks/run_decode_benchmark.py \
-  --checkpoint artifacts/koemi-3hip.pt --device cuda \
+  --checkpoint artifacts/koemi-4hcm.pt --device cuda \
   --max-new-tokens 256 --report artifacts/decode.json
 ```
 
@@ -634,7 +643,7 @@ the license and corpus claims: https://huggingface.co/datasets/HuggingFaceTB/smo
 
 For a nine-hour Colab Pro A100 run, use
 [`notebooks/Koemi-3HIP_A100.ipynb`](notebooks/Koemi-3HIP_A100.ipynb). The notebook
-pins the Koemi-3HIP source revision, runs local contract tests before downloading
+pins its source revision, runs local contract tests before downloading
 data, mounts Google Drive for resumable rotating checkpoints, and calibrates the
 microbatch against the detected A100. Its default 0.205B-parameter configuration
 uses BF16 autocast, TF32 matmuls, 128 deterministic experts with 6 active per
@@ -659,21 +668,21 @@ Run its separate plan and preflight before training; `BulkPrefixCache` remains
 inference-only because skipping exact training prefixes would skip gradients.
 
 ```bash
-.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-3hip.json
-.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-3hip.json
+.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-4hcm.json
+.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-4hcm.json
 .venv/bin/python benchmarks/run_ablation.py --task recall --seeds 17 29 41 --train-records 1024 --evaluation-records 1024 --epochs 4 --report artifacts/ablation-recall.json
 ```
 
-The harness compares Koemi-3HIP with parameter-matched GRU and LSTM baselines. The
+The harness compares Koemi-4HCM with parameter-matched GRU and LSTM baselines. The
 old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
-and are not Koemi-3HIP results. The ablation runner requires at least three seeds and
+and are not Koemi-4HCM results. The ablation runner requires at least three seeds and
 reports mean and standard deviation. The affine control is the minimum quality
 baseline; a small-budget single-seed run is not evidence of memory capacity.
 
 ### Legacy training, before Koemi became HIP
 
 The following plot belongs to the pre-HIP training line. It is preserved as a
-historical record, not presented as current Koemi-3HIP evidence:
+historical record, not presented as current Koemi-4HCM evidence:
 
 ![Legacy pre-HIP training curves](assets/legacy-pre-hip-training-curves.png)
 
@@ -730,11 +739,14 @@ confidence gate or salient ring.
 - The optimization lab provides opt-in CUDA, context and batching seams. The
   exact `BulkPrefixCache` path and prefill/decode API are connected to explicit
   generation callers, and the length-aware sampler is available through the two
-  training flags, but none changes the default model or loader path. Static
-  expert dispatch is inference-only while autograd and offload retain the
-  reference path for bit-exact contracts. This CPU-only host has not measured
-  CUDA overlap, native kernel speed, end-to-end batching gain or context quality;
-  exact SSD block payloads are not encrypted.
+  training flags, but none changes the default model or loader path. Native CUDA
+  operator fronts are compiled and measured on the A100 harness, but are not
+  integrated into the default model or loader path. Static expert dispatch is
+  inference-only while autograd and offload retain the reference path for
+  bit-exact contracts. This CPU-only host has not measured CUDA overlap,
+  end-to-end batching gain or context quality; the remote operator measurements
+  do not establish an end-to-end model gain. Exact SSD block payloads are not
+  encrypted.
 - The new `ModelIdentity` metadata does not make a model self-identify in
   generated text. That behavior needs trained examples and a behavior test;
   source, weights and data licenses also require separate legal review.
@@ -755,7 +767,7 @@ src/koemi/
   model/          HERM state, memory, cache, scan, CUDA seams and deterministic MoE
   runtime/        parameter offload, inference batching, bulk blocks, prefix cache, async enqueue, fast decode, serving and MoE Submapping
   training/       Causal chunks, objective, trainer, batching plan, checkpoint catalog, vocabulary expansion and generation
-benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines, plus the decode path comparison
+benchmarks/       Koemi-4HCM against parameter-matched GRU and LSTM baselines, plus the decode path comparison
 tests/            Data, model, cache, execution and training contracts
 examples/         Valid JSON and JSONL inputs
 ```

@@ -4,19 +4,19 @@ schema: 2
 updated_at: 2026-09-18
 ---
 
-# MapSource - Koemi-3HIP
+# MapSource - Koemi-4HCM
 
 ## Goal
 
-Evoluir a Koemi-3HIP para uma base causal de treino comparavel em ergonomia a
-um Transformer pequeno, com memoria hierarquica scanavel, treino instrumentado
-e uso heterogeneo de recursos sem desperdicio deliberado.
+Consolidar a Koemi-3HIP em Koemi-4HCM, uma base causal de treino com memoria
+hierarquica scanavel, treino instrumentado, identidade de artefato e uso
+heterogeneo de recursos sem desperdicio deliberado.
 
 ## Release status
 
-Koemi-3HIP, versao experimental para testes de treino e benchmark.
-Nao e a consolidacao final da HERM; os gates de recall, ablacao e comparacao
-com baselines ainda precisam ser fechados.
+Koemi-4HCM, versao de consolidacao tecnica para fonte, runners, checkpoints,
+identidade e frentes nativas CUDA. Os gates de recall, ablacao, comparacao com
+baselines e integracao end-to-end CUDA ainda precisam ser fechados.
 
 ## Active specification
 
@@ -212,7 +212,8 @@ flowchart LR
 - `src/koemi/model/scan.py` - affine scan and previous-state operations.
 - `src/koemi/model/cache.py` - bounded token, exact mapping and prefix-state caches.
 - `src/koemi/model/cuda_scan.py` - CUDA-only affine scan backend seam using
-  PyTorch tensor operations; native kernel remains out of scope.
+  PyTorch tensor operations; the isolated native dense front is documented
+  separately and does not replace this reference seam.
 - `src/koemi/model/gpu_memory.py` - reusable fixed-layout CPU/CUDA state buffers.
 - `src/koemi/model/gpu_precision.py` - device-safe AMP/TF32 policy and FP32 probes.
 - `src/koemi/model/context_summary.py` - bounded multi-rate EMA summary and
@@ -221,7 +222,7 @@ flowchart LR
 - `src/koemi/model/context_policy.py` - bounded causal surprise/recency/novelty
   admission policy.
 - `src/koemi/model/experts.py` - stacked expert bank, hash and learned dispatch.
-- `src/koemi/model/network.py` - Koemi-3HIP forward paths.
+- `src/koemi/model/network.py` - Koemi-4HCM forward paths.
 - `src/koemi/training/dataset.py` - causal chunks, thinking masks and optional
   length-aware batch sampler.
 - `src/koemi/training/objective.py` - causal and thinking-weighted loss.
@@ -1058,7 +1059,8 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
 - [x] Koemi-1FPA research prototype, historical.
 - [x] Koemi-3HIP implementation.
 - [x] Koemi-3HIP verification and documentation.
-- [ ] Koemi-3HIP CPU/GPU benchmark with sufficient recall budget.
+- [x] Koemi-4HCM consolidation dossier and native CUDA operator verification.
+- [ ] Koemi-4HCM end-to-end CPU/GPU benchmark with sufficient recall budget.
 - [x] HERM memory and contextual MoE, branch `main`, active.
 - [x] Full training pipeline and private SSD cache, branch `main`, queued.
 - [x] KOEMI-010 separate data and initialization seeds.
@@ -2802,6 +2804,37 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
 - The fast path uses PyTorch's CUDA GEMM through ATen and materializes a float
   logits matrix; it is not a standalone fused matrix-multiply kernel. The
   measured result is an operator benchmark, not an end-to-end model claim.
+
+### 2026-09-18 - Koemi-4HCM release preparation
+
+- Consolidated the public release name as Koemi-4HCM (Koemi-4 HERM
+  Consolidation Model), package version `0.4.0`, while retaining 3HIP notebook,
+  asset and benchmark names where changing them would break provenance or
+  compatibility.
+- Added `docs/KOEMI_4HCM_RELEASE.md` as the launch dossier. It records the
+  3HIP-to-4HCM delta, HERM execution chain, identity/licensing boundaries,
+  checkpoint catalog, training-log evidence, native CUDA evidence and explicit
+  non-claims.
+- The supplied training log was read from
+  `C:\Users\Brenno\Documents\LOGS IMPORTANTES TREINANDO DA IA.txt`. Snapshots
+  at optimizer steps `18700` through `18800` report `456,175,358` to
+  `458,615,359` tokens seen, loss `0.5128` to `0.5844` nats, answer BPB
+  `0.6136` to `0.6580`, thinking BPB `1.0821` to `1.1901`, supervised
+  throughput `23,484` to `30,211` tokens/s and peak allocation
+  `33,727,177,216` bytes. The 128-expert bank was occupied in every snapshot;
+  routing entropy and Gini are recorded as distribution evidence, not semantic
+  specialization.
+- Updated README, architecture, optimization-lab, A100 design, benchmark and
+  fast-decode text so native CUDA is described as measured operator evidence,
+  not default runner acceleration. No tracked file was identified as safely
+  disposable; historical notebooks, assets and ledgers remain intentionally.
+- Acceptance criteria: current public prose names 4HCM; release dossier is
+  self-contained; package metadata is `0.4.0`; training facts are traceable to
+  the supplied log; native CUDA limits are explicit; local checks and the full
+  suite pass; no tag, push, weight upload or dataset redistribution occurs.
+- Assumptions: the release is source-only until a separate weights/data/legal
+  decision is made; legacy artifact names remain compatibility paths; the
+  default runner remains the numerical and integration boundary.
 
 ### Open risks introduced by the A100 verification
 

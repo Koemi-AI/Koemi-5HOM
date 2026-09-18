@@ -4,6 +4,10 @@ This file separates historical Koemi-1FPA and pre-HIP HERM measurements from
 current Koemi-3HIP measurements. The old numbers must not be quoted as current
 Koemi-3HIP results.
 
+The current release name is Koemi-4HCM. This ledger keeps the 3HIP label because
+the measurements and notebook revisions are historical; the release summary is
+[`docs/KOEMI_4HCM_RELEASE.md`](KOEMI_4HCM_RELEASE.md).
+
 ## Historical Koemi-1FPA run
 
 Measured on 2026-09-11 with Python 3.13.14, PyTorch 2.14.0+cpu and four CPU

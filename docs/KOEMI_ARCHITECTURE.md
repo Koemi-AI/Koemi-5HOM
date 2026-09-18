@@ -1,7 +1,8 @@
-# Koemi-3HIP architecture
+# Koemi-4HCM architecture
 
-Koemi-3HIP (Koemi-3 HERM Initial Phase) is the current research architecture for training causal models in
-the Koemi infrastructure. Its state family is HERM (Hierarchical Error-Refined
+Koemi-4HCM (Koemi-4 HERM Consolidation Model) is the current consolidation
+architecture for training causal models in the Koemi infrastructure. It started
+as Koemi-3HIP (Koemi-3 HERM Initial Phase). Its state family is HERM (Hierarchical Error-Refined
 Memory). HERM is an architecture and runtime mechanism; it is not a trained
 model by itself.
 
@@ -15,7 +16,7 @@ path as a numerical oracle for the parallel path.
 The project takes its memory vocabulary from [Titans + MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/).
 MIRAS separates memory architecture, attentional bias, retention gate and
 memory algorithm. Titans is a concrete architecture that uses an online-updated
-neural memory. Koemi-3HIP currently uses a bounded associative state and does
+neural memory. Koemi-4HCM currently uses a bounded associative state and does
 not claim to reproduce Titans.
 
 ## Non-goals
@@ -168,7 +169,7 @@ y_t = RMSNorm(z_t + (1/K) Σ_k FFN_{e_{t,k}}(z_t))
 
 `K = expert_top_k` experts process each valid token (the default `K=1` preserves
 the legacy path). There is no routing projection, risk head, soft mixture or
-routing loss. This is a deliberate trade-off: Koemi-3HIP has a predictable sparse
+routing loss. This is a deliberate trade-off: Koemi-4HCM has a predictable sparse
 expert bank, not learned semantic MoE dispatch. `expert_count = 0` skips the bank.
 
 Absolute position is excluded so a repeated bigram has a stable expert. The
@@ -200,7 +201,7 @@ as a hidden cognition claim.
 
 ## Cache tiers and chains
 
-Koemi-3HIP has explicit cache tiers:
+Koemi-4HCM has explicit cache tiers:
 
 | Tier | Location | Content | Reuse rule |
 | --- | --- | --- | --- |
@@ -232,8 +233,9 @@ only uses disk for exact mappings whose read can replace a complete computation.
 The parallel path partitions long sequences into `scan_chunk` windows. Inside a
 window it uses an affine scan for recurrent state and a causal dense contraction
 for associative reads and the final state. The sequential path performs the same
-equations one token at a time. Tests compare
-logits, state tensors and selected gradients before any GPU kernel optimization.
+equations one token at a time. Tests compare logits, state tensors and selected
+gradients before a CUDA front is accepted. The native fronts remain isolated
+from the reference runner.
 
 This is tensor-level parallelism, not an `asyncio` scheduler. Causal state
 dependencies still serialize the chain boundary, while independent positions
@@ -244,7 +246,20 @@ performance claim.
 Training defaults to CUDA when available in the CLI and falls back to CPU. The
 model does not allocate a second deep path, so removing routing reduces
 parameters and intermediate tensors directly. Actual speed and VRAM changes
-must be measured by the Koemi-3HIP benchmark.
+must be measured by a Koemi-4HCM benchmark on the target device.
+
+## Native CUDA fronts
+
+Koemi-4HCM includes four opt-in native CUDA slices under
+[`src/koemi/cuda_kernels/`](../src/koemi/cuda_kernels/): core fused RMSNorm/SiLU,
+dense affine scan, causal think/surprise and MoE route/permute/group/combine.
+The A100 harness compiled and contract-checked all four. Core, dense and think
+also have operator microbenchmarks; these are not end-to-end model throughput
+claims, and the default `KoemiModel` path still provides the numerical oracle.
+
+The think fast path uses ATen CUDA GEMM plus custom warp-shuffle reductions and a
+coalesced logits-gradient kernel. It materializes float logits, so it is not a
+fully fused standalone matrix-multiply implementation.
 
 ## Implementation status
 
@@ -261,13 +276,14 @@ must be measured by the Koemi-3HIP benchmark.
 | Optional SSD exact prefix ledger | `model/cache.py`, `training/generation.py` | implemented |
 | Semantic episodic memory | none | out of scope |
 | Learned semantic retrieval | none | out of scope |
-| Distributed/GPU kernel path | none | pending |
+| Native CUDA operator fronts | `cuda_kernels/{core,dense,think,moe}` | compiled and contract-checked on A100; opt-in |
+| End-to-end CUDA runner integration | default model/trainer | not promoted; target-device gate remains open |
 
 ## Required gates before architecture claims
 
 - MQAR, copy and needle recall at a budget where at least one baseline solves
   the task;
-- Koemi-3HIP versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
+- Koemi-4HCM versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
   tokenizer, parameter count, token budget, precision and device;
 - p50/p95 training and decode throughput, peak VRAM/RAM and state bytes;
 - ablations for `expert_count`, local window, memory feature width and cache
@@ -275,5 +291,5 @@ must be measured by the Koemi-3HIP benchmark.
 - cache invalidation, corruption, retention and cross-session isolation tests;
 - NaN/Inf, state norm, surprise distribution and write-rate reports.
 
-Until those gates run, Koemi-3HIP is a research hypothesis with executable contracts,
+Until those gates run, Koemi-4HCM is a research hypothesis with executable contracts,
 not evidence that Koemi models are comparable to a production AI system.

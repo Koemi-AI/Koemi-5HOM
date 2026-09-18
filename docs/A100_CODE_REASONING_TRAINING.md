@@ -4,6 +4,8 @@ This is the execution contract for the A100 Colab run. It replaces the
 five-hour T4-oriented corpus with a pinned English programming and verified
 mathematics mixture. It is a training experiment, not a claim of general
 intelligence or a promise that every Colab session will remain available.
+The consolidated release context is in
+[`docs/KOEMI_4HCM_RELEASE.md`](KOEMI_4HCM_RELEASE.md).
 
 ## Decision
 
@@ -112,5 +114,6 @@ long training begins.
 - A 29-hour credit balance is not a continuous runtime entitlement. The
   notebook is designed for repeated bounded Colab sessions.
 - It does not execute training data, evaluate external benchmark archives,
-  add a CUDA kernel, use multi-GPU training, or represent an unmeasured
-  throughput result as a quality result.
+  integrate the opt-in native CUDA slices into the default training loop, use
+  multi-GPU training, or represent an unmeasured throughput result as a quality
+  result.

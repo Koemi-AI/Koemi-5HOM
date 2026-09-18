@@ -182,7 +182,7 @@ stays a byte checkpoint, and the checkpoint format version does not change.
 
 ```bash
 .venv/bin/python -m koemi expand-vocabulary \
-  --checkpoint artifacts/koemi-3hip.pt \
+  --checkpoint artifacts/koemi-4hcm.pt \
   --vocabulary artifacts/vocabulary.json \
   --output artifacts/koemi-hybrid.pt
 ```
@@ -205,7 +205,8 @@ training, not as the same model with a bigger head.
   token streams as `bytes`, so the A100 runner is byte-only. The hybrid path runs
   through the CLI trainer. Moving the A100 runner would mean changing its stream
   storage to a wider integer array, and that file drives a paid run.
-- No CUDA measurement exists for any of this. The CUDA graph tests are written
+- No CUDA measurement exists for the fast-decode or tokenizer paths described
+  here. The CUDA graph tests are written
   and skip on a host without a device; the benchmark reports the graph path only
   when CUDA is present.
 - Graph capture combined with BF16 autocast is written but unexecuted. Capture

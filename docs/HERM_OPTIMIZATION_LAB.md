@@ -4,8 +4,9 @@ Status: experimental and opt-in. The current machine has `torch 2.14.0+cpu`
 and no CUDA device. The modules below define bounded seams and executable
 contracts; `BulkPrefixCache` is connected to generation when explicitly
 selected. Length-aware training and prefill/decode batching are available at
-explicit opt-in boundaries, but the repository still has no measured GPU
-speedup, memory-quality improvement or end-to-end throughput result.
+explicit opt-in boundaries. A separate A100 harness now has measured native
+operator results, but there is still no measured end-to-end throughput or
+memory-quality improvement result.
 
 ## Verdict
 
@@ -19,7 +20,8 @@ profile identifies as dominant.
 
 | Area | Module | Contract | Current status |
 | --- | --- | --- | --- |
-| CUDA scan | `koemi.model.cuda_scan` | CUDA-only affine scan with chunk carry, validation and synchronized diagnostics | PyTorch tensor-op backend; no native `.cu` kernel; not wired into `KoemiModel` |
+| CUDA scan | `koemi.model.cuda_scan` | CUDA-only affine scan with chunk carry, validation and synchronized diagnostics | PyTorch tensor-op backend; native dense `.cu` front is isolated and not wired into `KoemiModel` |
+| Native CUDA fronts | `koemi.cuda_kernels/{core,dense,think,moe}` | Fused core, affine scan, causal surprise and MoE route/group contracts | Compiled and contract-checked on A100; opt-in, not end-to-end |
 | State memory | `koemi.model.gpu_memory` | Reusable fixed-layout buffers with explicit reset/resize and optional stream scope | CPU-tested; CUDA path is conditional and unmeasured |
 | Precision | `koemi.model.gpu_precision` | Device-safe FP32/BF16/FP16 policy, scoped TF32 flags and FP32 comparison | CPU-tested; CUDA AMP and numerical tolerance are unmeasured |
 | Context summary | `koemi.model.context_summary` | Multi-rate bounded EMA slots, surprise-gated EMA/momentum memory, evidence and confidence-gated reads | Opt-in; `read_device` is the hot path, validation and serialization remain explicit host boundaries |
@@ -56,9 +58,12 @@ complete final suite ran 300 tests with 13 conditional CUDA skips, and
 `compileall` passed. This section remains contract evidence, not performance
 evidence.
 
-No A100/T4 execution, CUDA kernel timing, GPU memory profile, end-to-end batch
-throughput, context recall ablation, cache hit-rate study, or quality comparison
-was run on this host. The default HERM model and loader path were intentionally
+The local host has no CUDA device, so no local A100/T4 execution is possible. The
+separate A100 harness compiled and contract-checked the four native fronts. Core,
+dense and think also produced operator timings; the MoE front stopped at route,
+permute, grouped-MLP and combine contracts. No end-to-end batch throughput, GPU
+memory profile, context recall ablation, cache hit-rate study or quality
+comparison was run. The default HERM model and loader path were intentionally
 not changed; the optional training sampler and generation APIs are explicit
 caller choices.
 
