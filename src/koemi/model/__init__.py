@@ -9,6 +9,12 @@ from koemi.model.context_summary import (
     SurpriseMemoryState,
 )
 from koemi.model.execution import ExecutionMode
+from koemi.model.identity import (
+    ModelIdentity,
+    ModelLicensing,
+    attach_model_identity,
+    get_model_identity,
+)
 from koemi.model.network import KoemiModel, KoemiOutput
 
 __all__ = [
@@ -21,8 +27,12 @@ __all__ = [
     "ExecutionMode",
     "KoemiModel",
     "KoemiOutput",
+    "ModelIdentity",
+    "ModelLicensing",
     "SurpriseMemory",
     "SurpriseMemoryRead",
     "SurpriseMemoryState",
     "WarmTokenCache",
+    "attach_model_identity",
+    "get_model_identity",
 ]

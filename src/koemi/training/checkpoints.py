@@ -8,6 +8,7 @@ import torch
 
 from koemi.configuration.settings import ModelSettings
 from koemi.data.hybrid_tokenizer import HybridVocabulary
+from koemi.model.identity import ModelIdentity, attach_model_identity
 from koemi.model.network import KoemiModel
 
 
@@ -22,6 +23,7 @@ class LoadedCheckpoint:
     model: KoemiModel
     model_settings: ModelSettings
     vocabulary: HybridVocabulary | None = None
+    identity: ModelIdentity | None = None
 
 
 class CheckpointStore:
@@ -32,12 +34,15 @@ class CheckpointStore:
         overwrite: bool = False,
         *,
         vocabulary: HybridVocabulary | None = None,
+        identity: ModelIdentity | None = None,
     ) -> Path:
         target_path = Path(checkpoint_path).expanduser().resolve()
         if target_path.exists() and not overwrite:
             raise FileExistsError(f"checkpoint already exists: {target_path}")
         if vocabulary is not None and vocabulary.vocabulary_size != model.settings.vocabulary_size:
             raise ValueError("the vocabulary size does not match the model head")
+        if identity is not None and not isinstance(identity, ModelIdentity):
+            raise TypeError("checkpoint identity must be a ModelIdentity instance")
         target_path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
             "format_version": CHECKPOINT_FORMAT_VERSION,
@@ -46,6 +51,8 @@ class CheckpointStore:
         }
         if vocabulary is not None:
             payload["vocabulary"] = vocabulary.to_payload()
+        if identity is not None:
+            payload["identity"] = identity.to_payload()
         torch.save(payload, target_path)
         return target_path
 
@@ -62,7 +69,11 @@ class CheckpointStore:
         vocabulary = None if raw_vocabulary is None else HybridVocabulary.from_payload(raw_vocabulary)
         if vocabulary is not None and vocabulary.vocabulary_size != model_settings.vocabulary_size:
             raise ValueError("the stored vocabulary does not match the checkpoint head")
-        return LoadedCheckpoint(model, model_settings, vocabulary)
+        raw_identity = checkpoint.get("identity")
+        identity = None if raw_identity is None else ModelIdentity.from_payload(raw_identity)
+        if identity is not None:
+            attach_model_identity(model, identity)
+        return LoadedCheckpoint(model, model_settings, vocabulary, identity)
 
     def validate_checkpoint(self, raw_checkpoint: Any) -> dict[str, Any]:
         if not isinstance(raw_checkpoint, dict):
@@ -76,6 +87,9 @@ class CheckpointStore:
         raw_vocabulary = raw_checkpoint.get("vocabulary")
         if raw_vocabulary is not None and not isinstance(raw_vocabulary, dict):
             raise ValueError("checkpoint vocabulary payload is invalid")
+        raw_identity = raw_checkpoint.get("identity")
+        if raw_identity is not None and not isinstance(raw_identity, dict):
+            raise ValueError("checkpoint identity payload is invalid")
         return raw_checkpoint
 
 

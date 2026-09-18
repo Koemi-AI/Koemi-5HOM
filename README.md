@@ -203,6 +203,53 @@ the mean of the rows of the bytes it expands to. The migrated checkpoint is a wa
 start, not the same model: surprise is normalized over the content vocabulary, so
 a larger vocabulary changes surprise and therefore the memory writes.
 
+## Model identity and release licensing
+
+HERM artifacts can carry a machine-readable `ModelIdentity` with a custom
+heading, organization, model name, version, architecture, variant and
+description. Source, weights and data availability are declared separately, so
+a source-only release can be represented without claiming that its weights are
+open.
+
+This header is artifact metadata, not a system prompt and not a guarantee that
+generated text will identify itself. `CheckpointStore` and the immutable
+`CheckpointCatalog` preserve it beside the tensor payload; loading a legacy
+checkpoint without the field remains supported. Behavioral self-identification
+requires training and an evaluation contract.
+
+```python
+from koemi.model.identity import ModelIdentity, ModelLicensing
+
+identity = ModelIdentity(
+    organization="Koemi Labs",
+    model_name="Koemi HERM",
+    version="0.4.0",
+    heading="Koemi HERM by Koemi Labs",
+    licensing=ModelLicensing(
+        source_license="MIT",
+        source_availability="open",
+        weights_availability="closed",
+    ),
+)
+```
+
+Licensing metadata documents intent; it does not grant rights over code,
+weights, datasets or trademarks that the owner does not hold.
+
+## Isolated MoE Submapping layout
+
+`koemi.runtime.moe_submapping` is an MoE-only storage slice. It publishes
+immutable, SHA-256-verified expert tensor blocks under a manifest, reads only
+the unique experts selected by the deterministic HERM route, and exposes
+byte-bounded LRU metrics plus bounded prefetch. A manifest can carry the same
+model identity and licensing metadata.
+
+The slice is intentionally separate from the normal model runner. It does not
+change `KoemiModel`, the existing runner, routing precision or `top_k`, and it
+does not claim an SSD or GPU speedup. Current validation is CPU-local; real
+NVMe, VRAM staging, asynchronous overlap and end-to-end model equivalence are
+still acceptance work for a future MoE runner.
+
 ## Architecture
 
 ```mermaid
@@ -677,7 +724,7 @@ confidence gate or salient ring.
   acceptance rate is the number that decides it, and no acceptance rate has been
   measured on a trained checkpoint.
 - Speculative decoding handles one sequence at a time. Batched speculation needs
-  ragged acceptance handling that is not implemented.
+  ragged acceptance handling that is unavailable in this phase.
 - No Triton kernel, distributed training, semantic retrieval, persistent
   episodic memory or tool use exists.
 - The optimization lab provides opt-in CUDA, context and batching seams. The
@@ -688,6 +735,16 @@ confidence gate or salient ring.
   reference path for bit-exact contracts. This CPU-only host has not measured
   CUDA overlap, native kernel speed, end-to-end batching gain or context quality;
   exact SSD block payloads are not encrypted.
+- The new `ModelIdentity` metadata does not make a model self-identify in
+  generated text. That behavior needs trained examples and a behavior test;
+  source, weights and data licenses also require separate legal review.
+- `CheckpointCatalog` is an opt-in immutable catalog with payload hashes and
+  `weights_only=True` recovery. The legacy training runners are not migrated to
+  it in this phase, and multi-writer locking, signatures and encryption remain
+  open.
+- The isolated MoE Submapping slice publishes per-tensor blocks, not a proven
+  production cube/mmap engine. It has no current `KoemiModel` integration and
+  no verified NVMe, GPU, prefetch-overlap or throughput result.
 
 ## Project layout
 
@@ -696,8 +753,8 @@ src/koemi/
   configuration/  Model and training settings
   data/           JSON validation, adapters, serialization, byte and hybrid tokenizers
   model/          HERM state, memory, cache, scan, CUDA seams and deterministic MoE
-  runtime/        parameter offload, inference batching, bulk blocks, prefix cache, async enqueue, fast decode and speculation
-  training/       Causal chunks, objective, trainer, batching plan, checkpoint, vocabulary expansion and generation
+  runtime/        parameter offload, inference batching, bulk blocks, prefix cache, async enqueue, fast decode, serving and MoE Submapping
+  training/       Causal chunks, objective, trainer, batching plan, checkpoint catalog, vocabulary expansion and generation
 benchmarks/       Koemi-3HIP against parameter-matched GRU and LSTM baselines, plus the decode path comparison
 tests/            Data, model, cache, execution and training contracts
 examples/         Valid JSON and JSONL inputs

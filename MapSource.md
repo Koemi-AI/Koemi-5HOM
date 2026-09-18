@@ -70,6 +70,14 @@ com baselines ainda precisam ser fechados.
   sequencia 512, corpus limitado a 200.000 registros e calibracao ampliada de
   microbatch ate o limite medido de VRAM; `BulkPrefixCache` permanece somente
   para inferencia exata.
+- Frente de decode rapido: caminho de inferencia sem sincronizacao host/device,
+  estado recorrente de forma estatica, captura CUDA Graph opcional, geracao em
+  lote com amostragem no dispositivo e decodificacao especulativa exata com
+  rascunho por modelo menor ou por n-grama do proprio contexto.
+- Tokenizer hibrido: vocabulario byte-level BPE com bytes 0-255, padding em 256,
+  marcadores de span reservados e merges aprendidos acima deles; codificacao
+  por segmento para que nenhum token atravesse a fronteira de um marcador, e
+  migracao do checkpoint byte-only por expansao de linhas do embedding e da head.
 
 ### Out of scope
 
@@ -139,6 +147,24 @@ com baselines ainda precisam ser fechados.
   preflight real antes do corpus remoto.
 - [x] Perfil agressivo gera plano separado e calibra microbatch na GPU real;
   BulkPrefixCache nao e aplicado ao treino porque isso eliminaria gradientes.
+- [x] O decode rapido concorda com o laco guloso de referencia e nao chama
+  `.item()`, `tolist`, `__int__`, `__float__` nem `__bool__` por token; o guarda
+  de sincronizacao do teste dispara no forward validante e nao no decode.
+- [x] O estado estatico concorda com o dinamico em logits (atol 1e-5) e mantem
+  uma unica forma em todos os campos do `KoemiState` ao longo dos passos.
+- [x] A verificacao especulativa aceita o prefixo correto, reamostra do residuo
+  e no modo guloso produz a mesma sequencia que `generate_batch`; a igualdade
+  vale ate a diferenca de ponto flutuante entre janela e passo (atol 1e-4).
+- [x] `HybridTokenizer.decode(encode(text)) == text` para ASCII, acentuacao,
+  emoji, CJK, bytes de controle e `bytes(range(256))` via `encode_bytes`.
+- [x] Nenhum token hibrido atravessa a fronteira de `<|system|>`, `<|input|>`,
+  `<|thinking|>` ou `<|output|>`: os ids que a mascara supervisionada seleciona
+  decodificam exatamente para o texto da span correspondente.
+- [x] A expansao copia bit a bit as 257 linhas originais de embedding e head e
+  inicializa cada linha nova na media das linhas dos bytes que ela expande. Os
+  logits coincidem nas colunas antigas apenas com `ablation=no_surprise`: a
+  surpresa e normalizada pelo vocabulario de conteudo, entao crescer o
+  vocabulario muda a surpresa e, com ela, as escritas de memoria.
 
 ### Assumptions
 
@@ -217,6 +243,16 @@ flowchart LR
   cache connected to generation.
 - `src/koemi/runtime/bulk_executor.py` - bounded CPU preparation and optional CUDA
   stream/event enqueue.
+- `src/koemi/runtime/fast_decode.py` - fixed-shape decode loop, device-side
+  sampling, static recurrent state, CUDA graph capture and batched generation.
+- `src/koemi/runtime/speculative.py` - block verification, rejection sampling and
+  the n-gram and small-model drafters.
+- `src/koemi/data/hybrid_tokenizer.py` - byte-level BPE vocabulary with reserved
+  span markers, trainer and encoder/decoder.
+- `benchmarks/run_decode_benchmark.py` - timed comparison of the decode paths on
+  one device.
+- `docs/FAST_DECODE_AND_HYBRID_TOKENIZER.md` - design, contracts and CPU numbers
+  for both subsystems.
 - `src/koemi/observability/report.py` - self-validating standard run report.
 - `src/koemi/observability/resources.py` - peak memory probe per device.
 - `benchmarks/run_benchmark.py` - three-model harness emitting the standard report.
@@ -243,6 +279,18 @@ flowchart LR
   RAM/SSD blocks, generation prefix reuse and bounded async preparation/enqueue;
   only `BulkPrefixCache` is connected at the generation boundary, and none of
   these components executes the model implicitly.
+- `src/koemi/runtime/fast_decode.py` - `BatchDecoder`, `TokenSampler`,
+  `to_static_state` and `generate_batch`; the only component that sets
+  `trusted_inputs`.
+- `src/koemi/runtime/speculative.py` - `accept_draft_tokens` holds the acceptance
+  rule; `NgramDrafter` and `ModelDrafter` only supply proposals.
+- `src/koemi/data/hybrid_tokenizer.py` - id layout, merge learning and encoding;
+  `src/koemi/data/serialization.py` holds `record_segments`, which is the single
+  source of span boundaries for both the byte and the token serializations.
+- `src/koemi/training/checkpoints.py` - optional `vocabulary` payload and
+  `expand_model_vocabulary`.
+- `src/koemi/model/experts.py` - `cache_stacked_experts` and its invalidation on
+  `train()`, on `load_state_dict` and on a device or dtype change.
 - `src/koemi/training/dataset.py` - `thinking_mask` propagation.
 - `src/koemi/training/objective.py` - weighted token cross entropy.
 - `src/koemi/training/a100_run.py` - source adapters, corpus manifest, batch
@@ -717,6 +765,253 @@ training and validation loaders.
 Rejected alternative: enforcing the limit only after collation, which would
 already have allocated an over-budget tensor.
 
+### D-035 - Fast decode is a caller contract, never a default
+
+`trusted_inputs=True` is the caller promising that the batch carries real token
+ids and no padding. The model then skips `validate_input_ids` and takes the token
+count from the tensor size, which removes three host synchronizations per step.
+`BatchDecoder` is the only component that sets it, and it validates the prompt
+once before the loop. `to_static_state` pads both rings to capacity with zeroed
+invalid slots, which reads identically to the growing state and keeps one shape
+per step so a CUDA graph can be captured.
+
+Rejected alternative: removing the validation from `forward` outright. The
+default path would lose its guard, and an out-of-range id would reach
+`nn.Embedding` as a device-side assert instead of a Python error.
+
+### D-036 - One acceptance core, two draft sources
+
+`accept_draft_tokens` implements speculative rejection sampling once.
+`NgramDrafter` supplies a point-mass proposal, so the acceptance probability is
+exactly the target mass on the proposed token; `ModelDrafter` supplies a smaller
+model's distribution. A fully accepted block reuses the state the verification
+forward produced; a rejected block restores the saved state and replays only the
+accepted tokens, because the window forward exposes no intermediate state.
+
+The exactness claim is bounded: a windowed forward and a step-by-step forward
+agree at `atol=1e-4`, not bit for bit, so the committed distribution matches the
+target up to that difference. `SpeculativeStatistics` reports acceptance and
+tokens per target call, because two forwards per block is a loss when acceptance
+collapses.
+
+Rejected alternative: materializing per-position associative state so a partial
+accept needs no replay. That reintroduces the `[B,L,d,m]` intermediate
+KOEMI-ROOT-007 removed.
+
+### D-037 - The hybrid vocabulary extends the byte layout instead of replacing it
+
+Ids 0-255 stay single bytes and 256 stays padding, so `padding_idx`, the dataset
+collation and every existing checkpoint row keep their meaning. The four span
+markers take 257-260 and learned merges start at 261. Each record span is encoded
+separately, which makes it structurally impossible for a merge to cross a marker
+and shift the supervised mask. `expand_model_vocabulary` copies the existing rows
+and seeds each new row at the mean of the rows of the bytes it expands to.
+
+Expansion preserves the weights, not the function: surprise is the causal NLL
+normalized by `log(content vocabulary size)`, so a larger vocabulary changes
+surprise and therefore the memory write weights. The migrated checkpoint is a
+warm start.
+
+Rejected alternative: moving the padding id to the top of the vocabulary. It
+gives contiguous content ids but invalidates every existing checkpoint and the
+collation constant for no gain that matters here.
+
+### D-038 - Expert dispatch is a measured seam, not a replacement
+
+`_forward_with_module_dispatch` runs one `torch.nonzero` per expert per scan
+window, so the aggressive A100 profile issues 512 device-to-host synchronizations
+per forward. `_forward_with_sorted_segments` reaches the same values with one
+`scatter_add_` count, one stable `argsort` and one `tolist`, so it issues one.
+Each expert then receives a contiguous slice of rows sorted by expert instead of
+a gathered index set.
+
+Sorted segments stay ragged rather than capacity-padded. The measured load in the
+2026-09-17 training log puts `load_max/load_mean` between 2,11 and 2,73, so a
+capacity-padded bank would compute roughly 2,4x the rows it needs. Ragged segments
+also keep the dispatch dropless, which the out-of-scope list requires.
+
+Measured equality on CPU, at width 24, 16 experts and top-6: the forward is
+bitwise identical, every expert parameter gradient is bitwise identical, and the
+input gradient differs by at most 9,095e-13 against a gradient of scale 3,574,
+which is 468.000 times below the float32 resolution at that scale. End to end on
+the 32-wide model over three seeds, logits and state are bitwise identical and the
+whole-model gradient differs by 5,9e-08 of the gradient norm, half of float32
+epsilon.
+
+`ModelSettings.expert_dispatch` defaults to `loop`, so no existing run changes.
+Rejected alternative: making segments the default now. KOEMI-017 records an
+earlier dispatch rewrite in this repository that measured 0,17x against the loop
+it replaced, and this host cannot run CUDA.
+
+Rejected alternative: `_apply_batched_experts` for training. It gathers a weight
+slice per token-expert pair, which is 182,2 GiB per scan window at the aggressive
+profile (KOEMI-043).
+
+### D-039 - Length batching is a seam, and a new setting must not break a resume
+
+`MaterializedCausalByteDataset` cuts every record at fixed `sequence_length`
+offsets, so the tail chunk of each record is short. The 2026-09-17 log shows
+`valid_input_tokens` between 27.141 and 30.186 of 32.768 padded slots, 12,5% mean
+padding, because `DeterministicBatchSampler` mixes tail chunks with full ones and
+`collate_materialized_chunks` pads to the longest row.
+
+`LengthBucketedBatchSampler` drives `BatchingMode` with `preserve_order=False`,
+`max_batch_size` equal to the selected batch size and a seeded batch shuffle.
+Batch size stays fixed, so the effective batch, the accumulation count and the
+schedule are unchanged and only the membership of each batch changes. Measured on
+a lognormal corpus of 12.672 chunks at batch 64: 15,53% padding to 0,28%.
+
+Rejected alternative: a padded-token budget with variable batch size. It packs
+slightly better but changes the effective batch per step, which changes the
+optimization dynamics and would need a learning-rate re-tune to compare fairly.
+
+The second half of this decision is the resume contract. `run_manifest` compares
+`model_settings` field by field, and `run_signature` fingerprints it, so adding
+`expert_dispatch` to `ModelSettings` would have made the manifest comparison fail
+and the checkpoint signature change. The session in flight at optimizer step
+18.700 would have refused to resume. `run_model_settings_view` and
+`normalize_manifest_model_settings` drop a setting that still holds the value
+reproducing the older behaviour, and `run_batching_view` contributes nothing while
+`batching` is `index`. Verified in this session: the aggressive run signature is
+byte identical before and after both seams were added,
+`4136eeba166bb47e4cdd4a346aa01b5dfe84dd5dd737bc71c45681dbe4c6eee8`, and turning
+either seam on produces a different signature, which is correct because the data
+order and the dispatch both change.
+
+Rule this sets: any future optional field in `ModelSettings` or `RunConfiguration`
+goes into `LEGACY_MODEL_SETTING_DEFAULTS` or an equivalent view before it ships,
+with a test that pins the old fingerprint.
+
+### D-040 - The sliding window lives in score space, and recompute stays off
+
+`read_window` produced its scores from a strided `unfold` view, so the einsum
+materialized a `[batch, length, width, window]` tile and normalized every key once
+per window it appeared in. A saved-tensor probe at width 256, chunk 64, batch 2,
+length 256 put that tile at 80,00 MiB of 153,10 MiB of saved activations, 52,3%,
+spread over three layouts.
+
+The score form contracts `width` away first: one `[batch, length, carried + length]`
+matrix, masked to the band of the `window` entries strictly preceding each query.
+That is exactly what `read_salient_window` already did, so this removes an idiom
+the module contradicted itself on. Saved activations fall 50,3%, and the isolated
+read measures 8,17x faster at width 256 and 15,35x at width 512, forward plus
+backward, because the redundant normalization disappears with the tile. Agreement
+with the strided form is 1e-5 absolute, which is contraction order, not a change
+of function.
+
+`activation_checkpointing` recomputes a whole scan window during backward. It
+works and it is tested, and it takes saved activations from 76,17 MiB to 1,42 MiB
+at a cost of 1,48x per step. It stays off, because memory is not the binding
+constraint: peak is 31,41 GiB against an 80 GiB card and the calibrator stops at
+batch 64 only because that is the last candidate in its list. Paying 1,48x to free
+memory nobody is using would be a loss.
+
+Rejected alternative: keeping the band as an explicit gather of `window` entries
+per position. It restores the `[batch, length, width, window]` tile under another
+name, which is the thing being removed.
+
+This is the second new `ModelSettings` field to pass through the D-039 rule, and
+the fingerprint test caught it: `LEGACY_MODEL_SETTING_DEFAULTS` now carries both
+`expert_dispatch` and `activation_checkpointing`, and the aggressive run signature
+is still `4136eeba166bb47e4cdd4a346aa01b5dfe84dd5dd737bc71c45681dbe4c6eee8`.
+
+### D-041 - Metrics leave the step's critical path, and the batch ceiling becomes explicit
+
+Four items from the 2026-09-17 optimization list.
+
+`KoemiOutput.expert_activation_counts` ran
+`tuple(int((assignments == index).sum()) for index in range(expert_count))`, one
+host read per expert. `expert_activation_totals` replaces it with a masked
+`scatter_add_`, which touches neither `torch.nonzero` nor `torch.bincount` nor a
+boolean index, so it issues no synchronization at all; the tuple property reads it
+once when a caller actually wants numbers. `MetricAccumulator` now carries a
+device tensor and reads it only when the epoch line is written. Counts match the
+old comparison loop exactly at 1, 3, 8 and 16 experts.
+
+`a100_run` computed the per-token cross entropy twice per microbatch, once inside
+`calculate_training_objective` and once as
+`token_cross_entropy(output.logits.float(), target_ids)` for the metrics, which
+also upcast a 32,1 MiB tensor. `TrainingObjective` now returns the `token_loss` it
+already built. Measured bitwise identical in FP32 and under BF16 autocast, because
+`cross_entropy` is on the autocast FP32 list and the explicit `.float()` was
+redundant.
+
+`target_effective_batch_size` was a literal 64 in the manifest and the learning
+rate a literal 3e-4 in two places, while the aggressive calibrator's candidate
+list also ended at 64. That combination hid a trap: `gradient_accumulation_steps`
+is `ceil(effective / selected)`, so a calibrator allowed to pick 128 would have
+silently doubled the effective batch instead of accumulating. Both are now
+`RunConfiguration` fields, the candidate list reaches 256, and the calibrator is
+clamped to the effective batch, so a microbatch can never exceed it. The plan also
+reports `linear_scaled_learning_rate` next to the chosen one. It is reported and
+never applied: raising the effective batch changes the optimization, and that is
+the operator's decision.
+
+`compile_forward` wraps `forward_window` with `torch.compile`. It cannot be
+measured on this host: inductor fails with
+`InvalidCxxCompiler: Compiler: cl is not found`. What is measurable is the
+tracing, and it corrects an earlier claim. Segments does not make the graph
+static; it makes the break count stop growing. At 8, 16 and 32 experts,
+`torch._dynamo.explain` on `forward_window` reports:
+
+| experts | dispatch | graphs | breaks | ops |
+|---|---|---|---|---|
+| 8 | loop | 6 | 5 | 244 |
+| 8 | segments | 5 | 4 | 316 |
+| 16 | loop | 7 | 6 | 249 |
+| 16 | segments | 5 | 4 | 380 |
+| 32 | loop | 7 | 6 | 249 |
+| 32 | segments | 5 | 4 | 428 |
+
+Segments holds at five graphs while the op count inside them grows, so more work
+becomes compilable. Neither path reaches a single graph: the loop breaks on
+`Dynamic shape operator`, which is `torch.nonzero`, and segments on
+`Data dependent operator`, which is the `tolist` that reads the segment sizes.
+Removing that last break needs a fixed-capacity bank or a grouped kernel, both of
+which are out of scope here.
+
+All four defaults reproduce the run in flight, and `compile_forward` is the third
+field to pass through the D-039 rule.
+
+### D-042 - Serving batches continuously, because position never reaches the model
+
+`InferenceBatchScheduler` owned a queue and executed nothing. `BatchDecoder`
+executed and assumed one batch stayed together from prefill to finish. Neither is
+serving on its own: a real load admits a request while others are mid-generation.
+
+Continuous batching is exact for this model, and the reason is recorded rather
+than assumed. No computation in `src/koemi/model/network.py` reads
+`KoemiState.step_index`; it is propagated and used only by the prefix cache for
+validation at `src/koemi/model/cache.py:106`. D-022 removed absolute position from
+the expert hash under KOEMI-ROOT-009. Verified in this session: a model given a
+state with `step_index` 9.999 returns logits and every state field bitwise equal
+to the same model at `step_index` 0. So a row admitted this step and a row two
+hundred tokens in decode identically side by side.
+
+`ServingEngine.step` does exactly one unit of work: admit what fits, prefill the
+admissions, decode every active row once, emit, retire. Keeping the unit explicit
+is what makes the equivalence testable. `stack_states` joins per-sequence states
+and `select_state_rows` takes them apart; both demand rings already at capacity,
+which `to_static_state` guarantees.
+
+The acceptance criterion is agreement with decoding each request alone: three
+concurrent requests, a request joining four steps into a running batch, and a
+request whose neighbour runs five times longer all produce exactly the tokens the
+single-stream oracle produces.
+
+Admission control is the security boundary, because prompts are external input.
+Prompt length, new-token budget and every token id are checked at submit, so a
+caller cannot occupy a row and fail later; ids outside the content vocabulary and
+the padding id are refused. Concurrency is capped and the rest waits. Every stop
+condition closes the stream with its own reason, never a silent drop.
+
+Rejected alternative: CUDA graph capture inside the engine. The batch width
+changes whenever a row joins or leaves and a captured graph is fixed to one shape.
+
+Rejected alternative: shipping a transport with it. Deployment is on the
+out-of-scope list, so this is the engine and the network surface stays a separate
+decision.
+
 ## Work fronts
 
 - [x] Koemi-1FPA research prototype, historical.
@@ -751,6 +1046,29 @@ already have allocated an over-budget tensor.
 - [x] Frente A100 segura, 2026-09-16: runner separado do notebook, alvo
   0.205B, 45.000 registros, 25 sessoes de 7,5h, custo calculado em
   US$ 1.190,04, preflight pequeno e confirmacao obrigatoria antes da rede.
+- [x] Frente E, 2026-09-17: pilha de decode rapido em
+  `src/koemi/runtime/fast_decode.py` e `src/koemi/runtime/speculative.py`,
+  opt-in, com seam `trusted_inputs` no forward, estado estatico, captura CUDA
+  Graph, cache de pesos de expert e decodificacao especulativa exata. CPU
+  medido; CUDA escrito e coberto por testes condicionais, nao executado.
+- [x] Frente J, 2026-09-17: motor de serving com continuous batching em
+  `src/koemi/runtime/serving.py`, equivalente ao decode isolado por teste, com
+  streaming, cancelamento, deadline e admission control. Sem transporte.
+- [x] Frente I, 2026-09-17: metricas fora do caminho critico, cross entropy
+  duplicada removida, effective batch e learning rate configuraveis com o teto do
+  calibrador explicito, e seam `compile_forward`. Suite em 470 testes.
+- [x] Frente H, 2026-09-17: leitura de janela local em espaco de score e
+  checkpointing de ativacao por janela. A primeira corta 50,3% das ativacoes
+  salvas e mede 8,17x a 15,35x na leitura isolada; a segunda fica desligada
+  porque memoria nao e o gargalo atual. Suite em 449 testes.
+- [x] Frente G, 2026-09-17: despacho de experts por segmentos ordenados e batching
+  por bucket de comprimento, ambos opt-in. `expert_dispatch` e `batching` mantem
+  o default antigo, o run em voo continua retomando e a suite fecha em 439 testes.
+  Falta medir os dois na A100.
+- [x] Frente F, 2026-09-17: tokenizer hibrido em
+  `src/koemi/data/hybrid_tokenizer.py`, serializacao por segmento, expansao de
+  vocabulario no checkpoint e comandos `build-vocabulary`/`expand-vocabulary`.
+  O runner A100 continua byte-only por decisao de risco.
 
 ## Suspicion zone
 
@@ -1251,6 +1569,321 @@ already have allocated an over-budget tensor.
   retain rolling aggregates with separate answer and thinking denominators
   before choosing checkpoints or reporting convergence.
 
+### KOEMI-037 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/network.py:76` and `src/koemi/runtime/fast_decode.py:184`
+- Condition: `trusted_inputs=True` skips `validate_input_ids`, so a caller that
+  is not `BatchDecoder` can pass an id outside the vocabulary.
+- Impact: on CUDA the bad id reaches `nn.Embedding` as a device-side assert that
+  kills the context instead of raising a Python error.
+- Proposed fix: keep the flag caller-owned and documented; if a third component
+  starts using it, add a cheap range check at that boundary rather than inside
+  the decode loop.
+
+### KOEMI-038 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/runtime/fast_decode.py:236`
+- Condition: CUDA graph capture assumes the static expert dispatch path. If the
+  bank falls back to module dispatch, because of offload hooks or meta-device
+  parameters, the captured region includes `torch.nonzero`, whose output shape
+  depends on the data.
+- Impact: capture can fail, or a replay can reuse a shape recorded for another
+  token, producing wrong logits without an error.
+- Proposed fix: refuse capture when `_requires_module_dispatch()` is true, and
+  assert it in the first CUDA run on the target device.
+
+### KOEMI-039 #risk/medium
+
+- Severity: medium
+- Status: open, declared in README and in `docs/FAST_DECODE_AND_HYBRID_TOKENIZER.md`
+- Location: `src/koemi/model/network.py:calculate_surprise`
+- Condition: surprise normalizes by `log(vocabulary_size - 1)`, so expanding the
+  vocabulary changes surprise for the same input bytes.
+- Impact: a checkpoint migrated by `expand-vocabulary` writes different memory
+  weights than before the migration; treating it as an equivalent model would
+  misread its first evaluation.
+- Evidence: `tests/training/test_vocabulary_expansion.py` asserts the change; the
+  same test shows the logits do coincide with `ablation=no_surprise`.
+- Proposed fix: measure bits per byte after a short continuation run before
+  comparing a migrated checkpoint against its byte ancestor.
+
+### KOEMI-040 #risk/low
+
+- Severity: low
+- Status: open
+- Location: `src/koemi/runtime/speculative.py:accept_draft_tokens`
+- Condition: speculative exactness assumes the windowed verification forward
+  returns the same distribution as a step-by-step forward. The two agree at
+  `atol=1e-4` in FP32; BF16 autocast widens that gap.
+- Impact: the committed token distribution drifts from the target distribution by
+  an amount nobody has measured under BF16.
+- Proposed fix: on the target GPU, compare `extend` against repeated `step` in the
+  training precision before trusting speculation for sampled, non-greedy output.
+
+### KOEMI-041 #risk/medium
+
+- Severity: medium
+- Status: open, declared to the user
+- Location: `src/koemi/training/a100_run.py:119`
+- Condition: `MaterializedCausalByteDataset` stores token, supervision and
+  thinking streams as `bytes`, which cannot hold an id above 255.
+- Impact: the A100 runner cannot train a hybrid checkpoint; hybrid training only
+  runs through the CLI trainer.
+- Proposed fix: move the three streams to `array("i")` or a numpy int32 buffer and
+  update `collate_materialized_chunks`. That file drives a paid run, so the change
+  needs its own front and its own contract test against `CausalByteDataset`.
+
+### KOEMI-042 #risk/high
+
+- Severity: high
+- Status: mitigated behind `expert_dispatch="segments"`, CPU measured, CUDA pending
+- Location: `src/koemi/model/experts.py:132` (`_forward_with_module_dispatch`)
+- Condition: training always takes the module dispatch path because
+  `torch.is_grad_enabled()` is true, and that path runs one `torch.nonzero` per
+  expert per scan window. Measured on CPU with 16 experts and `scan_chunk=32`
+  over a 128-token sequence: 4 windows, 64 `torch.nonzero` calls. The aggressive
+  A100 profile has 128 experts and 4 windows per 512-token forward, so it issues
+  512 `torch.nonzero` calls per forward; `torch.nonzero` needs the result count
+  on the host, so each one is a device-to-host synchronization on CUDA.
+- Impact: the expert stage cannot overlap with anything and each expert receives
+  a few dozen to a few hundred rows, so the GPU runs 512 launch-bound GEMMs per
+  forward instead of a small number of contiguous ones. In the same CPU probe the
+  expert stage cost 0.129 s against 0.047 s for the affine scan, the projection,
+  `scan_and_read`, the local read and the salient read combined.
+- Proposed fix: sort the flattened assignments by expert once, take `bincount`
+  once, copy those counts to the host once, and run one contiguous GEMM per
+  non-empty expert over a slice of the sorted rows, scattering back with
+  `index_add_`. That keeps the dispatch dropless, keeps autograd, and drops the
+  synchronizations from 512 to 1 per forward. Implemented 2026-09-17 as
+  `_forward_with_sorted_segments`, selected by `ModelSettings.expert_dispatch`,
+  which defaults to `loop`. `tests/model/test_segment_dispatch.py` holds the
+  equivalence contract. `benchmarks/run_dispatch_benchmark.py` measures both paths
+  on one device. At the real profile shape on CPU (128 experts, top-6,
+  `scan_chunk` 128, sequence 512) it reports 512 `torch.nonzero` calls for the
+  loop against 0 for segments, and 1,22x on forward plus backward even where no
+  synchronization is saved. Still to do: run that benchmark on the A100 before
+  changing the default, because KOEMI-017 records an earlier dispatch rewrite in
+  this repository that measured 0.17x against the loop it replaced.
+
+### KOEMI-043 #risk/medium
+
+- Severity: medium
+- Status: open, declared to the user
+- Location: `src/koemi/model/experts.py:169` (`_apply_batched_experts`)
+- Condition: the batched path gathers one full expert weight slice per
+  token-expert pair. At the aggressive A100 profile (width 1.152, hidden 2.304,
+  128 experts, top-6, `scan_chunk` 128, batch 16) that is 12.288 pairs times
+  three matrices of 1.152 by 2.304 in BF16, which is 195.689.447.424 bytes, or
+  182,2 GiB, per scan window.
+- Impact: the existing batched dispatch can never serve training or prefill; it
+  is only viable for single-step decode. Measured on CPU at 16 experts and width
+  128 it cost 20,8 s against 0,129 s for the module loop, a 161x regression, which
+  reproduces the trend KOEMI-014 recorded (1,851x at 2 experts, 0,287x at 32).
+- Proposed fix: never route training through `_apply_batched_experts`. The
+  sorted-segment GEMM of KOEMI-042 gathers rows, not weights, so its temporary
+  memory is linear in tokens instead of linear in tokens times parameters.
+
+### KOEMI-044 #risk/low
+
+- Severity: low
+- Status: open
+- Location: `src/koemi/model/network.py:129` (`forward_parallel`)
+- Condition: the window loop carries `KoemiState` from window to window in
+  Python, so a 512-token forward runs four dependent stages. The carry is exactly
+  composable: `BoundedRecurrentState.gates` at `src/koemi/model/memory.py:22`
+  reads only the embedding, never the recurrent state, and `scan_and_read`
+  already returns the chunk decay factor and the chunk write contribution in
+  closed form. A two-level chunk scan would compute every chunk in parallel, scan
+  the per-chunk carries, then apply them, with the same values.
+- Impact: three avoidable sequential stages per forward today, and the count
+  grows linearly with sequence length, so the cost of this structure rises if the
+  sequence moves above 512.
+- Evidence: not measured. The composition argument holds only while
+  `ablation="no_refine"`, which the A100 profiles use; the refine tier reads
+  `fast_memory` and therefore needs a second pass.
+- Proposed fix: implement it behind an opt-in seam after KOEMI-042, and gate it
+  on exact agreement with the window loop in logits, state and gradients.
+
+### KOEMI-045 #risk/medium
+
+- Severity: medium
+- Status: mitigated behind `batching="length"`, not the default
+- Location: `src/koemi/training/a100_run.py:1147` (`create_loader`), `DeterministicBatchSampler`
+- Condition: the A100 sampler batches by index, not by length, so short records
+  pad up to `sequence_length`. Measured over the six log lines of 2026-09-17 at
+  batch 64 and sequence 512: `valid_input_tokens` ran from 27.141 to 30.186 of
+  32.768 padded slots, so 7,9% to 17,2% of every forward is padding, mean 12,5%.
+- Impact: about one eighth of the training compute produces nothing, and it
+  explains most of the 29% spread in `supervised_tokens_per_second` across the
+  same six steps (23.484 to 30.211).
+- Proposed fix: closed 2026-09-17 by `LengthBucketedBatchSampler`, which drives
+  `BatchingMode` with `preserve_order=False` and a fixed `max_batch_size`, so the
+  batch size, the effective batch and the learning-rate schedule stay as they are
+  and only the membership changes. Measured on a lognormal record-length corpus
+  of 12.672 chunks at batch 64: padding falls from 15,53% to 0,28% and padded
+  tokens fall 15,29%, which is 1,180x on the same real work. `bucket_size` 64 is
+  already at the floor; 8 reaches 0,25% and costs 21 more batches.
+  `batching` defaults to `index`, so no existing run changes.
+
+### KOEMI-046 #risk/low
+
+- Severity: low
+- Status: open, declared to the user
+- Location: `src/koemi/training/a100_run.py:1287`
+- Condition: `token_cross_entropy(output.logits.float(), target_ids)` recomputes
+  the per-token cross entropy that `calculate_training_objective` already computed
+  one line earlier, and it upcasts the logits to FP32 first.
+- Impact: one extra full cross entropy over `[64, 512, 257]` plus a 32,1 MiB
+  upcast per microbatch, only to feed the metrics. Small against the 873 ms step
+  measured on 2026-09-17, but it is pure duplicate work.
+- Proposed fix: have `calculate_training_objective` return the per-token loss it
+  already built and pass that tensor to `RunningMetrics.add`.
+
+### KOEMI-047 #risk/medium
+
+- Severity: medium
+- Status: open, declared to the user
+- Location: `src/koemi/model/network.py:37` (`KoemiOutput.expert_activation_counts`)
+- Condition: the property runs `tuple(int((assignments == index).sum()) for index
+  in range(self.expert_count))`, which is one host synchronization per expert.
+  `src/koemi/training/trainer.py` calls it once per batch through
+  `MetricAccumulator.add`, so the CLI trainer adds 128 synchronizations per batch
+  at the aggressive expert count.
+- Impact: the CLI training path carries a per-batch stall that the A100 runner
+  does not, because `RunningMetrics.add` uses `torch.bincount` instead.
+- Proposed fix: rewrite the property over `torch.bincount` and return the counts
+  as a tensor, letting the caller decide when to read them to the host.
+
+### KOEMI-049 #risk/medium
+
+- Severity: medium
+- Status: closed 2026-09-17
+- Location: `src/koemi/model/memory.py:read_window`
+- Condition: the sliding-window read built its scores from
+  `padded_keys.unfold(1, window, 1)`, and the einsum over that strided view
+  materialized a `[batch, length, width, window]` tile. It also normalized the
+  same key once per window it appeared in, which is `window` times of redundant
+  work.
+- Impact: measured with a saved-tensor probe at width 256, chunk 64, batch 2,
+  length 256, that tile held 80,00 MiB of 153,10 MiB of saved activations, 52,3%,
+  across three layouts. At the aggressive A100 profile one such tensor is 576,0
+  MiB in BF16.
+- Evidence: rewritten into the score form `[batch, length, carried + length]`,
+  which is the idiom `read_salient_window` already used. Saved activations fall
+  to 76,05 MiB, a 50,3% cut, and the isolated read measures 8,17x faster at width
+  256 and 15,35x at width 512, forward plus backward. Outputs agree with the
+  strided form to 1e-5 absolute; the difference is contraction order.
+- Proposed fix: closed. `tests/model/test_activation_memory.py` keeps the strided
+  form as the equivalence oracle.
+
+### KOEMI-050 #risk/low
+
+- Severity: low
+- Status: open, declared to the user
+- Location: `src/koemi/model/network.py:run_window`
+- Condition: `activation_checkpointing` recomputes each scan window during
+  backward. Measured at width 256, chunk 64, batch 2, length 256: saved
+  activations fall from 76,17 MiB to 1,42 MiB, 53,6x, and the step costs 1,48x.
+- Impact: the trade only pays when memory is the binding constraint. It is not
+  today: the 2026-09-17 log shows 31,41 GiB of peak against an 80 GiB card, and
+  the batch calibrator stops at 64 because that is the end of its candidate list,
+  not because memory ran out. Turning this on now would cost 1,48x for headroom
+  nobody is using.
+- Proposed fix: leave it off until the sequence length, the width or the batch
+  grows enough that peak memory actually binds. Revisit together with raising the
+  calibrator's candidate list above 64, which is the change that would consume
+  the freed memory.
+
+### KOEMI-051 #risk/low
+
+- Severity: low
+- Status: open, declared to the user
+- Location: `src/koemi/training/objective.py:calculate_training_objective`
+- Condition: the objective still reads three values to the host per microbatch:
+  `int(supervised_mask.sum())`, `int(thinking_positions.sum())` and
+  `float(effective_weight.detach())`. `a100_run` adds two `bool(torch.isfinite(...))`
+  reads and one explicit `torch.cuda.synchronize` per optimizer step.
+- Impact: about six synchronizations per optimizer step. Small next to the 512 the
+  expert loop issued per forward, but they sit between the backward and the
+  optimizer step, so they block any overlap across steps.
+- Proposed fix: keep the guards but move them off the step path, for example by
+  checking finiteness once per log interval instead of once per microbatch. The
+  counts can stay device tensors until the log line is written.
+
+### KOEMI-052 #risk/medium
+
+- Severity: medium
+- Status: open, declared to the user
+- Location: `src/koemi/model/experts.py:_forward_with_sorted_segments`
+- Condition: `counts[: self.expert_count].tolist()` is the one remaining
+  data-dependent read in the dispatch, and `torch._dynamo.explain` names it as the
+  break that stops `forward_window` from compiling into a single graph.
+- Impact: `compile_forward` can only fuse the five fragments around it. Whatever
+  inductor would give on the A100 is bounded by that split.
+- Evidence: measured on 2026-09-17 with `torch._dynamo.explain`; see D-041 for the
+  table. Inductor itself could not run on this host.
+- Proposed fix: a fixed-capacity bank makes the segment sizes static and removes
+  the read, at the cost of the dropless property the out-of-scope list protects.
+  Decide which of the two matters more only after a CUDA profile shows what the
+  break actually costs.
+
+### KOEMI-053 #risk/medium
+
+- Severity: medium
+- Status: open, declared to the user
+- Location: `src/koemi/runtime/serving.py:_decode_once`
+- Condition: every decode step calls `int(sequence.next_token)` once per active
+  row to emit the token, which is one device-to-host read per row per step.
+- Impact: on CUDA that is `active_sequences` synchronizations per step, so the
+  engine loses the sync-free property `BatchDecoder` was built for. It is correct
+  but it caps throughput exactly where streaming matters.
+- Proposed fix: keep the emitted tokens on the device in a ring and drain them to
+  the host once per N steps, or hand the stream a device tensor and let the
+  consumer decide when to read. Measure on CUDA before choosing, because a
+  streaming API that batches its own reads adds latency to the first token.
+
+### KOEMI-054 #risk/low
+
+- Severity: low
+- Status: open, declared to the user
+- Location: `src/koemi/runtime/serving.py:_admit`
+- Condition: admissions are prefilled as one padded batch, left-padded to the
+  longest prompt in the admission group. A short prompt admitted next to a long
+  one pays the long one's width.
+- Impact: wasted prefill compute proportional to the spread of prompt lengths in
+  one admission, the same effect KOEMI-045 measured at 12,5% for training.
+- Proposed fix: reuse `LengthBucketedBatchSampler`'s idea at the admission
+  boundary, or admit in length buckets across several steps. Measure first: unlike
+  training, a serving admission is latency-sensitive and holding a short prompt
+  back to find a partner costs time to first token.
+
+### KOEMI-048 #risk/high
+
+- Severity: high
+- Status: open, declared to the user
+- Location: `src/koemi/training/a100_safe_run.py:156` (aggressive profile)
+- Condition: the expert bank holds 1,0200 B of the 1,0352 B parameters, 98,5% of
+  the model, and the shared trunk holds 15,2 M, 1,5%. With top-6 of 128 experts
+  only 63,0 M parameters, 6,1% of the model, are active per token.
+- Impact: two consequences. In training, measured MFU on 2026-09-17 is 3,98%:
+  10,84 TFLOP of model work per step against 0,873 s measured, where the A100 BF16
+  peak would need 34,7 ms. In decode, branch-parallel speculation cannot amortize
+  the weight read, because branches select different experts and the shared trunk
+  is too small to matter: the worst case improves tokens per byte read by only
+  1,27x at eight branches, against 8x if the branches shared their experts.
+- Evidence: parameter counts taken on a `meta` device from the aggressive profile;
+  step time derived from `supervised_tokens` over `supervised_tokens_per_second`
+  in the six log lines of 2026-09-17. Both numbers are arithmetic over measured
+  values, not a CUDA profile.
+- Proposed fix: decide whether the parameter budget is meant to sit almost
+  entirely in the expert bank. If it is, the dispatch cost dominates and KOEMI-042
+  is the front. If it is not, a wider trunk with fewer or smaller experts would
+  raise the active fraction and make decode amortizable.
+
 ## Resolved suspicions
 
 ### KOEMI-008 #risk/medium
@@ -1397,6 +2030,11 @@ already have allocated an over-budget tensor.
 - `.koemi-venv/Scripts/python.exe -m unittest discover -s tests -p 'test*.py'`
 - `.koemi-venv/Scripts/python.exe -m compileall -q src benchmarks tests`
 - `koemi train --report PATH --validation-fraction 0.1` writes the standard schema.
+- `.koemi-venv/Scripts/python.exe -m koemi build-vocabulary --dataset examples/canonical.jsonl --output artifacts/vocabulary.json --vocabulary-size 512`
+- `.koemi-venv/Scripts/python.exe -m koemi expand-vocabulary --checkpoint artifacts/koemi-3hip.pt --vocabulary artifacts/vocabulary.json --output artifacts/koemi-hybrid.pt`
+- `.koemi-venv/Scripts/python.exe -m koemi generate --checkpoint artifacts/koemi-3hip.pt --prompt "FIFO means" --fast-decode --greedy`
+- `.koemi-venv/Scripts/python.exe -m koemi generate --checkpoint artifacts/koemi-3hip.pt --prompt "FIFO means" --ngram-draft --draft-length 4`
+- `.koemi-venv/Scripts/python.exe benchmarks/run_decode_benchmark.py --embedding-size 128 --expert-count 8 --expert-top-k 2 --max-new-tokens 48 --greedy --synthetic-draft`
 
 ## Glossary
 
@@ -1415,6 +2053,15 @@ already have allocated an over-budget tensor.
   CPU staging and dependency ordering rather than implicit copies.
 - `prefix block`: fixed token sequence and bounded state identified by an exact
   namespace-scoped digest; it is not a semantic match.
+- `trusted inputs`: caller promise that a batch carries real ids and no padding,
+  which lets the forward skip validation and the mask reduction.
+- `static state`: recurrent state whose rings are held at capacity so every decode
+  step runs one shape.
+- `draft block`: tokens a drafter proposes for one verification forward.
+- `acceptance rate`: accepted draft tokens over proposed tokens; below roughly one
+  half, speculation costs more forwards than it saves.
+- `hybrid vocabulary`: byte-level BPE ids where 0-255 stay bytes, 256 stays
+  padding, 257-260 are the span markers and merges start at 261.
 
 ## Verification status
 
@@ -1941,3 +2588,105 @@ already have allocated an over-budget tensor.
 - Reported supervised throughput is 26,815.7-29,768.4 tokens/s and peak
   allocated memory is about 31.3 GiB across the samples. These values are
   user-provided remote-run evidence, not locally reproduced measurements.
+
+### 2026-09-17 - Fast decode stack and hybrid tokenizer
+
+- Added `src/koemi/runtime/fast_decode.py` and `src/koemi/runtime/speculative.py`.
+  `BatchDecoder` holds the recurrent rings at capacity, marks decode inputs
+  trusted, samples on the device and optionally replays one captured CUDA graph
+  per step. `generate_batch` decodes several prompts in one loop with a single
+  host transfer at the end. `speculative_generate` verifies whole draft blocks
+  through `accept_draft_tokens`, with `NgramDrafter` and `ModelDrafter` as the
+  two proposal sources.
+- `KoemiModel.forward` gained the keyword-only `trusted_inputs`, which removes
+  the `min`/`max` validation and the `valid_mask.sum()` reduction; the token
+  count then comes from the tensor size, which is exact because the caller has
+  promised there is no padding. `DeterministicExpertMixture` stopped stacking the
+  whole expert bank on every forward: `cache_stacked_experts` builds the stack
+  once and it is released by `train()`, by `load_state_dict` and by a device or
+  dtype change.
+- Added `src/koemi/data/hybrid_tokenizer.py`: byte-level BPE with ids 0-255 as
+  bytes, 256 as padding, 257-260 as the span markers and merges from 261.
+  `serialize_record_tokens` encodes each span separately, so no merge can cross a
+  marker. `CheckpointStore` now carries an optional vocabulary payload without a
+  format bump, and `expand_model_vocabulary` migrates a byte checkpoint by copying
+  its rows and seeding each new row at the mean of its bytes.
+- CLI: `build-vocabulary`, `expand-vocabulary`, `train --vocabulary`, and the
+  generate flags `--fast-decode`, `--cuda-graph`, `--greedy`, `--top-k`,
+  `--ngram-draft`, `--draft-checkpoint` and `--draft-length`. `main` now reports
+  `FileExistsError` as an exit-2 command failure instead of a traceback.
+- `.koemi-venv\Scripts\python.exe -m unittest discover -s tests -p 'test*.py'`:
+  413 tests, OK, 16 conditional skips (13 pre-existing CUDA skips plus the three
+  new CUDA graph tests). `compileall -q src benchmarks tests`: PASS.
+- Measured on this CPU-only host with random weights, 1,041,555 parameters,
+  8 experts top-2, 48 greedy tokens: baseline `generate_text` 42.1 tokens/s,
+  `fast_decode` 55.6 tokens/s, `speculative_ngram` 49.6 tokens/s at acceptance
+  0.50, and a random draft model 12.2 tokens/s at acceptance 0.00 with 96 target
+  forwards for 48 tokens. The last row is the cost of speculation without
+  acceptance, measured rather than argued.
+- Not verified: every CUDA path. The graph capture, the BF16 autocast decode and
+  any A100 throughput number remain unexecuted, because `torch.cuda.is_available()`
+  is false here. The hybrid vocabulary has no quality ablation, and the A100
+  runner stays byte-only under KOEMI-041.
+
+### 2026-09-17 - Model identity, checkpoint catalog and isolated MoE Submapping
+
+- Goal: make HERM artifacts nameable and distributable without pretending that a
+  system prompt creates internal identity; provide separate source, weights and
+  data availability; add a safer checkpoint publication boundary; and create a
+  fork-only MoE storage slice without touching the normal runner.
+- Scope: `ModelIdentity`/`ModelLicensing` with a custom heading and organization;
+  identity transport in `CheckpointStore`, `CheckpointCatalog` and the MoE
+  manifest; immutable, hashed catalog generations with `weights_only=True`
+  recovery; and `moe_submapping.py` with deterministic route validation,
+  immutable expert blocks, SHA-256 verification, byte-bounded LRU and bounded
+  prefetch.
+- Out of scope: changing `KoemiModel`, `experts.py`, `a100_run.py` or the
+  existing runner; a learned router; training from SSD; CUDA/H2D/VRAM staging;
+  asynchronous I/O; a production cube/mmap format; remote storage; signing,
+  encryption and legal authorization.
+- Acceptance criteria: identity payloads round-trip and attach to a loaded model
+  without entering `state_dict`; catalog recovery ignores corrupt newest data
+  and refuses unsafe payloads; MoE layout rejects non-MoE/traversal/corrupt
+  artifacts, reads only selected experts and preserves dtype/output; duplicate
+  valid top-k routes fail explicitly while padding remains unassigned.
+- Assumptions: the local runtime is Python 3.13 with CPU-only PyTorch, so local
+  tests can prove contracts and integrity but cannot prove SSD, GPU or throughput
+  gains. The normal runner remains the compatibility boundary.
+- Files: `src/koemi/model/identity.py`,
+  `src/koemi/training/checkpoint_catalog.py`,
+  `src/koemi/runtime/moe_submapping.py`, their focused tests, and the two public
+  documents under `docs/`.
+- Verification: the focused identity/catalog/MoE command passed 43 tests. The
+  final gate passed `.koemi-venv\Scripts\python.exe -m unittest discover -s
+  tests -p 'test*.py'` with 540 tests and 16 conditional skips, `compileall -q
+  src benchmarks tests`, and `git diff --check`. The runtime is CPU-only
+  (`torch 2.14.0+cpu`, CUDA unavailable); serving changes already committed at
+  `d9fcd2e` were covered by the same suite but are outside this block.
+- Architectural reference: Colibri's public design describes a VRAM/RAM/NVMe
+  hierarchy, LRU/prefetch and expert union; it is a reference only. No Koemi
+  performance claim is derived from it.
+
+### Open risks introduced by this block
+
+- KOEMI-051 - `src/koemi/runtime/moe_submapping.py:320-439` - condition: the
+  published layout is a CPU-testable per-tensor block store, not a connected
+  `KoemiModel` runner or a proven cube/mmap engine; impact: end-to-end MoE
+  inference and SSD/GPU gains are not demonstrated; severity: high; status: open.
+- KOEMI-052 - `src/koemi/runtime/moe_submapping.py:442-463` - condition: normal
+  symlink checks do not constitute a tested Windows junction/reparse-point and
+  TOCTOU defense; impact: a hostile writable layout could redirect a block read;
+  severity: high; status: open.
+- KOEMI-053 - `src/koemi/training/checkpoint_catalog.py:168-257` - condition:
+  catalog publication has atomic generation files but no process lock and no
+  adapter in the A100 runner; impact: concurrent writers and automatic resume
+  migration remain unproven; severity: medium; status: open.
+- KOEMI-054 - `src/koemi/model/identity.py:199-214` - condition: the header is
+  artifact metadata and is not part of the token stream or learned behavior;
+  impact: a model will not reliably verbalize its company/name without training
+  and evaluation; severity: medium; status: open.
+- KOEMI-055 - `src/koemi/model/experts.py:283-289` - condition: the legacy
+  assignment path can emit duplicate top-k experts and later deduplicate them;
+  impact: current runner semantics can reduce valid `k` silently; the isolated
+  fork rejects this condition and leaves the legacy path unchanged; severity:
+  high; status: open.

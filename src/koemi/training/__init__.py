@@ -1,3 +1,14 @@
+from koemi.training.checkpoint_catalog import (
+    CheckpointCatalog,
+    CheckpointCatalogError,
+    CheckpointManifest,
+    CheckpointManifestError,
+    CheckpointPathError,
+    CheckpointPayloadError,
+    CheckpointPublication,
+    CheckpointRecord,
+    CheckpointRecovery,
+)
 from koemi.training.checkpoints import CheckpointStore
 from koemi.training.dataset import CausalByteDataset, create_training_loader
 from koemi.training.generation import (
@@ -15,6 +26,15 @@ from koemi.training.trainer import Trainer, TrainingResult
 
 __all__ = [
     "CausalByteDataset",
+    "CheckpointCatalog",
+    "CheckpointCatalogError",
+    "CheckpointManifest",
+    "CheckpointManifestError",
+    "CheckpointPathError",
+    "CheckpointPayloadError",
+    "CheckpointPublication",
+    "CheckpointRecord",
+    "CheckpointRecovery",
     "CheckpointStore",
     "DecodeRequest",
     "DecodeResult",
