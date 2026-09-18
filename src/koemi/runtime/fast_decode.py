@@ -133,6 +133,26 @@ def select_state_rows(state: KoemiState, rows: Sequence[int], step_index: int | 
     )
 
 
+def stack_states(states: Sequence[KoemiState]) -> KoemiState:
+    """Join per-sequence states into one batched state, preserving row order.
+
+    Every state must already sit at ring capacity, which `to_static_state`
+    guarantees, so the rings concatenate without reshaping. `step_index` is
+    carried as the largest of the inputs: no computation in the model reads it,
+    so rows that sit at different positions still decode exactly.
+    """
+    if not states:
+        raise ValueError("stack_states requires at least one state")
+    joined = {}
+    for field_name in KOEMI_STATE_FIELDS:
+        tensors = [getattr(state, field_name) for state in states]
+        shapes = {tuple(tensor.shape[1:]) for tensor in tensors}
+        if len(shapes) != 1:
+            raise ValueError(f"states disagree on the shape of {field_name}; pad rings to capacity first")
+        joined[field_name] = torch.cat(tensors, dim=0)
+    return replace(states[0], **joined, step_index=max(state.step_index for state in states))
+
+
 class BatchDecoder:
     """Fixed-shape recurrent decoding for a batch of sequences.
 
