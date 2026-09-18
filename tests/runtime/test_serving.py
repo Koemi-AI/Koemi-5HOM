@@ -18,6 +18,7 @@ from koemi.runtime.fast_decode import (
 )
 from koemi.runtime.serving import (
     CANCELLED,
+    DEFAULT_PREFILL_BUCKET_SIZE,
     DEADLINE_EXCEEDED,
     STOPPED,
     TOKEN_LIMIT,
@@ -324,6 +325,149 @@ class IsolationTest(unittest.TestCase):
         self.assertEqual(metrics.generated_tokens, 8)
         self.assertEqual(metrics.completed_requests, 2)
         self.assertGreater(metrics.tokens_per_decode_step, 1.0)
+
+
+class HostReadProbe:
+    """Count every value moved from a tensor to the host."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __enter__(self) -> "HostReadProbe":
+        self._originals = (torch.Tensor.__int__, torch.Tensor.item, torch.Tensor.tolist)
+        probe = self
+
+        def counted(original):
+            def wrapper(tensor, *arguments, **keywords):
+                probe.count += 1
+                return original(tensor, *arguments, **keywords)
+
+            return wrapper
+
+        torch.Tensor.__int__ = counted(self._originals[0])
+        torch.Tensor.item = counted(self._originals[1])
+        torch.Tensor.tolist = counted(self._originals[2])
+        return self
+
+    def __exit__(self, *arguments) -> None:
+        torch.Tensor.__int__, torch.Tensor.item, torch.Tensor.tolist = self._originals
+
+
+class HostReadBudgetTest(unittest.TestCase):
+    def steady_state_reads(self, concurrency: int) -> int:
+        engine = ServingEngine(
+            build_model(), limits=ServingLimits(max_concurrent_sequences=concurrency)
+        )
+        for index in range(concurrency):
+            engine.submit(
+                GenerationRequest(
+                    f"r{index}", prompt(6, index * 3), max_new_tokens=8, policy=greedy()
+                )
+            )
+        engine.step()
+        with HostReadProbe() as probe:
+            engine.step()
+        return probe.count
+
+    def test_a_decode_step_reads_the_host_once_whatever_the_width(self) -> None:
+        for concurrency in (1, 4, 16, 32):
+            with self.subTest(concurrency=concurrency):
+                self.assertEqual(self.steady_state_reads(concurrency), 1)
+
+    def test_host_reads_do_not_grow_with_the_batch(self) -> None:
+        self.assertEqual(self.steady_state_reads(32), self.steady_state_reads(1))
+
+
+class PrefillBucketTest(unittest.TestCase):
+    def padded_prefill_tokens(self, bucket_size: int, lengths: tuple[int, ...]) -> tuple[int, int]:
+        counters = {"forwards": 0, "padded": 0}
+        original = BatchDecoder.prefill
+
+        def counted(decoder, input_ids):
+            counters["forwards"] += 1
+            counters["padded"] += int(input_ids.numel())
+            return original(decoder, input_ids)
+
+        BatchDecoder.prefill = counted
+        try:
+            engine = ServingEngine(
+                build_model(),
+                limits=ServingLimits(
+                    max_concurrent_sequences=len(lengths), prefill_bucket_size=bucket_size
+                ),
+            )
+            for index, length in enumerate(lengths):
+                engine.submit(
+                    GenerationRequest(
+                        f"r{index}", prompt(length, index), max_new_tokens=1, policy=greedy()
+                    )
+                )
+            engine.step()
+        finally:
+            BatchDecoder.prefill = original
+        return counters["forwards"], counters["padded"]
+
+    def spread(self) -> tuple[int, ...]:
+        return (3, 4, 5, 9, 11, 18, 33, 60, 120)
+
+    def test_bucketing_cuts_padded_prefill_tokens(self) -> None:
+        lengths = self.spread()
+        single_forwards, single_padded = self.padded_prefill_tokens(10**6, lengths)
+        bucket_forwards, bucket_padded = self.padded_prefill_tokens(16, lengths)
+        self.assertEqual(single_forwards, 1)
+        self.assertGreater(bucket_forwards, 1)
+        self.assertLess(bucket_padded, single_padded)
+        self.assertLessEqual(bucket_padded, single_padded // 2)
+
+    def test_no_group_mixes_two_length_buckets(self) -> None:
+        engine = ServingEngine(build_model(), limits=ServingLimits(prefill_bucket_size=8))
+        admitted = [
+            (GenerationRequest(f"r{index}", prompt(length, index), max_new_tokens=1), None, 0.0)
+            for index, length in enumerate((2, 7, 9, 15, 17, 40))
+        ]
+        for group in engine._prefill_groups(admitted):
+            keys = {(len(request.prompt_token_ids) - 1) // 8 for request, _, _ in group}
+            self.assertEqual(len(keys), 1)
+
+    def test_every_admitted_request_lands_in_exactly_one_group(self) -> None:
+        engine = ServingEngine(build_model(), limits=ServingLimits(prefill_bucket_size=8))
+        admitted = [
+            (GenerationRequest(f"r{index}", prompt(length, index), max_new_tokens=1), None, 0.0)
+            for index, length in enumerate((2, 7, 9, 15, 17, 40, 41))
+        ]
+        grouped = [
+            request.request_id for group in engine._prefill_groups(admitted) for request, _, _ in group
+        ]
+        self.assertEqual(sorted(grouped), sorted(request.request_id for request, _, _ in admitted))
+
+    def test_bucketing_does_not_change_a_single_token(self) -> None:
+        model = build_model()
+        lengths = self.spread()
+        prompts = {f"r{index}": prompt(length, index) for index, length in enumerate(lengths)}
+        expected = {name: reference_greedy(model, ids, 4) for name, ids in prompts.items()}
+        for bucket_size in (10**6, 32, 16, 4, 1):
+            with self.subTest(bucket_size=bucket_size):
+                engine = ServingEngine(
+                    model,
+                    limits=ServingLimits(
+                        max_concurrent_sequences=len(lengths), prefill_bucket_size=bucket_size
+                    ),
+                )
+                outcomes = engine.generate(
+                    [
+                        GenerationRequest(name, ids, max_new_tokens=4, policy=greedy())
+                        for name, ids in prompts.items()
+                    ]
+                )
+                for name in prompts:
+                    self.assertEqual(outcomes[name].token_ids, expected[name])
+
+    def test_the_default_bucket_is_the_measured_one(self) -> None:
+        self.assertEqual(ServingLimits().prefill_bucket_size, DEFAULT_PREFILL_BUCKET_SIZE)
+
+    def test_a_non_positive_bucket_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            ServingLimits(prefill_bucket_size=0)
 
 
 if __name__ == "__main__":
