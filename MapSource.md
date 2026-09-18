@@ -738,7 +738,11 @@ verified to support the same STDIO server through the global
 list` reports it enabled. An already-running Codex session does not reload its
 tool catalog, so a new session/restart is required before the tool appears.
 The MCP server being enabled is separate from the browser bridge being open;
-no Colab notebook code was executed during setup.
+on 2026-09-17 a fresh `codex exec --ephemeral --sandbox read-only` called
+`open_colab_browser_connection` after only that tool received explicit approval,
+and the MCP returned `structured_content.result: true`. The browser bridge is
+therefore open for this session; no Colab notebook code was executed during
+setup.
 
 Rejected alternative: exposing a public notebook endpoint that evaluates
 arbitrary Python or shell commands. The official local bridge is the safer
