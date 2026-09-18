@@ -2836,6 +2836,25 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   decision is made; legacy artifact names remain compatibility paths; the
   default runner remains the numerical and integration boundary.
 
+### 2026-09-18 - README rewrite and wooden-block explainers
+
+- Rewrote `README.md` as the public 4HCM entry point: 3HIP-to-4HCM delta,
+  plain-language HERM explanation, real CLI workflows, thinking spans, hybrid
+  tokenizer, identity/licensing, checkpoint catalog, fast decode, batching,
+  offload, MoE Submapping, CUDA fronts, A100 profiles, supplied-log evidence,
+  dataset contract, configuration reference, benchmarks and explicit non-claims.
+- Added three project-bound raster explainers generated with the imagegen skill:
+  `assets/koemi-4hcm-wooden-blocks-overview.png`,
+  `assets/koemi-4hcm-wooden-blocks-memory.png`, and
+  `assets/koemi-4hcm-wooden-blocks-moe-cuda.png`. They use arithmetic counting
+  blocks as a visual analogy, not Jenga and not literal model storage.
+- Scope: documentation and visual assets only. No model, runner, CUDA kernel,
+  checkpoint format, or default execution path was changed in this block.
+- Acceptance criteria: every README image resolves to a tracked project asset;
+  commands match current entry points; measured numbers retain their operator-
+  level boundary; the README names what is available and what is not claimed;
+  `git diff --check` and the full suite pass before commit.
+
 ### Open risks introduced by the A100 verification
 
 - KOEMI-059 - `src/koemi/cuda_kernels/think/surprise_kernel.cu:1-250` -

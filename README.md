@@ -1,42 +1,159 @@
 # Koemi-4HCM
 
-Koemi-4HCM (Koemi-4 HERM Consolidation Model) is the consolidation release of
-the Koemi training base for byte-level causal models built on
-HERM (Hierarchical Error-Refined Memory): bounded recurrent state, rank-one
-associative memory, exact recent and salient recall, and optional deterministic
-experts. The slower refine tier is opt-in.
+**Koemi-4 HERM Consolidation Model** is an open-source PyTorch research base
+for causal models with bounded recurrent state, hierarchical associative memory,
+exact bounded recall, deterministic MoE routing, checkpoint integrity, and
+optional native CUDA operator fronts.
 
-This repository contains architecture and training code. It does not ship a
-trained model and does not claim Transformer-level quality.
+The source release is MIT-licensed. This repository does not ship trained
+weights or a training corpus. Code, weights, datasets, and trademarks are
+separate artifacts and must keep their own licensing decision.
 
-The release map, measured A100 operator results and the boundary between source,
-weights and training data are in [`docs/KOEMI_4HCM_RELEASE.md`](docs/KOEMI_4HCM_RELEASE.md).
-The 3HIP name remains in historical notebooks, assets and benchmark records for
-compatibility and provenance.
+- Release dossier: [`docs/KOEMI_4HCM_RELEASE.md`](docs/KOEMI_4HCM_RELEASE.md)
+- Architecture: [`docs/KOEMI_ARCHITECTURE.md`](docs/KOEMI_ARCHITECTURE.md)
+- Identity and licensing: [`docs/MODEL_IDENTITY_AND_LICENSING.md`](docs/MODEL_IDENTITY_AND_LICENSING.md)
+- A100 training: [`docs/A100_SAFE_TRAINING.md`](docs/A100_SAFE_TRAINING.md)
+- CUDA and optimization boundary: [`docs/HERM_OPTIMIZATION_LAB.md`](docs/HERM_OPTIMIZATION_LAB.md)
+- MoE storage: [`docs/SUBMAPPING_MOE.md`](docs/SUBMAPPING_MOE.md)
 
-## Problem
+## The one-minute explanation
 
-Large attention models spend memory and compute repeatedly processing context.
-HERM keeps bounded associative state for the running sequence plus exact local
-and surprise-admitted buffers. Prefix-state snapshots let a later request resume
-from the longest byte-identical prefix instead of replaying it.
+Large attention models repeatedly revisit a growing context. HERM keeps a
+fixed-width causal state, learns compressed associations, and retains a small
+amount of exact recent or surprising detail. The state does not grow with the
+conversation length.
+
+The wooden blocks below are the mental model. They are arithmetic counting
+blocks like the ones used to learn multiplication, not a Jenga tower:
+
+![Koemi-4HCM architecture explained with wooden counting blocks](assets/koemi-4hcm-wooden-blocks-overview.png)
+
+1. Small blocks entering from the left are bytes or hybrid-token ids.
+2. The center stack is the bounded recurrent state. It is rebuilt every step,
+   but its shape stays fixed.
+3. The two circular trays are exact local and surprise-admitted memory.
+4. The colored vertical blocks are optional deterministic experts.
+5. The row on the right is the vocabulary prediction for the next byte/token.
+
+This is an analogy for the data flow, not a claim that the model stores literal
+wooden blocks.
+
+## What changed from 3HIP to 4HCM
+
+Koemi-3HIP was the initial HERM implementation. Koemi-4HCM consolidates the
+model, runtime, training, artifact identity, storage experiments, and CUDA
+fronts into one release boundary.
+
+| Area | 3HIP | 4HCM |
+| --- | --- | --- |
+| HERM core | Initial bounded recurrent and associative-memory path | Same causal model family documented as one coherent release |
+| Artifact identity | No stable public identity contract | `ModelIdentity` with organization, model name, version, custom heading, architecture, variant, and description |
+| Licensing | External documentation only | Source, weights, and data availability travel as separate metadata fields |
+| Checkpoints | Legacy checkpoint writers and rotating training checkpoints | Immutable `CheckpointCatalog` with payload hashes, retention, and `weights_only=True` recovery; legacy paths remain usable |
+| Training | Byte training, thinking masks, deterministic experts | Length-aware batching, A100 safe/aggressive profiles, rotating recovery, answer/thinking metrics, and measured expert occupancy |
+| Inference | Recurrent generation and exact prefix reuse | Fast decode, prefill/decode batching, speculative paths, RAM/SSD block reuse, and parameter offload seams |
+| Tokenization | Byte-first path | Hybrid byte/BPE vocabulary with migration and span-marker protection |
+| MoE | Deterministic content-hash dispatch in the normal model path | Isolated MoE-only Submapping storage fork plus native route/permute/group/combine kernels |
+| CUDA | PyTorch CUDA seams without a measured native-kernel record | Four opt-in `.cu` fronts compiled and contract-checked on an A100 |
+| Operations | Notebook and local runner paths | Bounded Colab MCP retryer with explicit retry and remote-failure markers |
+
+The consolidation name does not mean every experiment became the default
+execution path. The normal runner remains the compatibility and numerical
+oracle path.
+
+## What you can do with the repository
+
+| Use case | Available capability | Main entry point |
+| --- | --- | --- |
+| Train a causal model | Byte-level supervised training, AdamW, warmup/cosine scheduling, AMP, accumulation, validation, thinking loss | `python -m koemi train` |
+| Prepare data | Canonical JSON/JSONL plus Alpaca, ShareGPT, and UTF-8 text adapters | `src/koemi/data/` |
+| Generate text | Default recurrent decode, fast fixed-shape decode, greedy/sampling, system/user spans | `python -m koemi generate` |
+| Reuse exact work | RAM token cache, SSD prefix ledger, block-backed prefix cache | `src/koemi/model/cache.py`, `src/koemi/runtime/` |
+| Batch inference | Prefill/decode phases, length buckets, padded batches, request handles and deadlines | `inference_batching.py`, `generation.py` |
+| Speculate | N-gram or smaller-model proposal with verification and rejection sampling | `runtime/speculative.py` |
+| Reduce residency | Accelerator, host, and disk parameter tiers with measured offload logs | `python -m koemi train --offload-*` |
+| Change the vocabulary | Learn a byte/BPE hybrid vocabulary and migrate a byte checkpoint | `build-vocabulary`, `expand-vocabulary` |
+| Publish identity | Stable heading, model id, organization, version, and separate license fields | `ModelIdentity` |
+| Recover safely | Immutable generations, SHA-256 manifests, corruption rejection, retention | `CheckpointCatalog` |
+| Store sparse experts | Validated per-expert blocks, bounded LRU, digest checks, deterministic route | `MoeSubmappingStore` |
+| Compile CUDA fronts | Core, dense, think, and MoE native extensions on a CUDA host | `src/koemi/cuda_kernels/` |
+| Run A100 training | Preflight, budget ledger, resumable Drive checkpoints, pinned data revisions | `a100_safe_run.py`, `a100_run.py` |
+
+## A second block picture: memory and checkpoints
+
+![HERM memory and checkpoint recovery explained with wooden arithmetic blocks](assets/koemi-4hcm-wooden-blocks-memory.png)
+
+Read the picture from the middle outward:
+
+- the central stack is the fixed recurrent state;
+- the teal tray is fast associative memory;
+- the amber tray is the slower residual/refine memory;
+- the blue and cream rings are exact bounded recall;
+- the two lower boxes are alternating checkpoint generations;
+- the arrows mean “write a new state, verify it, and recover the newest valid
+  generation”, not “overwrite the only copy”.
 
 ## Install
 
-Requirements: Python 3.11 or newer and pip.
+Python 3.11 or newer is required. The package declares `numpy>=2.1` and
+`torch>=2.8`.
 
 ```bash
 python -m venv .venv
+
+# Linux/macOS
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/python -m pip install -e .
+
+# Windows PowerShell
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -e .
 ```
 
-On Windows, replace `.venv/bin/python` with `.venv\Scripts\python`.
+The repository itself has no required CUDA dependency. Native fronts activate
+only when the process has CUDA-enabled PyTorch, a compatible device, and a
+matching CUDA toolkit with `nvcc`.
+
+## First run: validate, train, generate
+
+Use the canonical example to check the data boundary before training:
+
+```bash
+python -m koemi inspect-dataset --dataset examples/canonical.jsonl
+```
+
+Train a small checkpoint:
+
+```bash
+python -m koemi train \
+  --dataset examples/canonical.jsonl \
+  --checkpoint artifacts/koemi-4hcm.pt \
+  --overwrite \
+  --expert-count 2 \
+  --thinking-loss-weight 2.0
+```
+
+Generate from it:
+
+```bash
+python -m koemi generate \
+  --checkpoint artifacts/koemi-4hcm.pt \
+  --system "Answer in one sentence." \
+  --prompt "Explain FIFO." \
+  --max-new-bytes 64 \
+  --greedy
+```
+
+The serialized record boundary protects role spans. Reserved markers such as
+`<|system|>`, `<|input|>`, `<|thinking|>`, and `<|output|>` are rejected when
+they appear as forged user/data content. `--raw-prompt` is available only for a
+checkpoint that was trained without those markers.
 
 ## Dataset contract
 
-The loader accepts UTF-8 `.txt`, `.json` arrays and `.jsonl` files. A normalized record uses
-this shape:
+`inspect-dataset` and `train` accept UTF-8 `.txt`, JSON arrays, and JSONL. Use
+`--dataset-format auto|canonical|alpaca|sharegpt` when auto-detection is not
+enough. The canonical record has this shape:
 
 ```json
 {
@@ -49,735 +166,479 @@ this shape:
 }
 ```
 
-`thinking` is optional. Its bytes receive a separate target mask and can be
-weighted with `--thinking-loss-weight`. The mask does not claim that visible
-thinking text is an internal reasoning trace.
+`system` is conditioning context and is not a supervised target. `thinking` is
+optional; its bytes receive their own target mask and can receive a separate
+loss weight. For plain text, set `output` to `null` and the complete `input`
+becomes the causal training sequence. Alpaca and ShareGPT records enter through
+validated adapters, and malformed records fail at the data boundary.
 
-`system` is optional and is context, never a target. Its bytes precede the input
-span and carry no supervision, so the model conditions on the instruction and is
-never trained to reproduce it. A record without `system` serializes to exactly the
-same bytes as before the field existed, which a test asserts, so datasets and
-checkpoints from earlier runs stay valid. A ShareGPT `system` turn now maps to this
-field instead of being rejected; several system turns join with a newline in the
-order they appear, and a top-level `system` field applies only when the
-conversation carries no system turn.
+## Thinking spans are supervised data
 
-For plain text, set `output` to `null`; the complete `input` becomes the causal
-training sequence. Alpaca and ShareGPT records enter through validated adapters.
+Thinking bytes can have their own mask and loss weight. They are visible
+training targets, not a promise of private chain-of-thought behavior.
 
 ```bash
-.venv/bin/python -m koemi inspect-dataset --dataset examples/canonical.jsonl
-```
-
-## Train
-
-The default model has no expert bank, which is the lowest-cost path. CUDA is
-selected by the CLI when available; use `--device cpu` for deterministic local
-verification.
-
-```bash
-.venv/bin/python -m koemi train \
+python -m koemi train \
   --dataset examples/canonical.jsonl \
-  --checkpoint artifacts/koemi-4hcm.pt \
-  --overwrite \
-  --expert-count 2 \
-  --thinking-loss-weight 2.0
+  --checkpoint artifacts/koemi-thinking.pt \
+  --thinking-loss-weight 2.0 \
+  --overwrite
+
+python -m koemi generate \
+  --checkpoint artifacts/koemi-thinking.pt \
+  --prompt "Work through this carefully." \
+  --prompt-target thinking \
+  --max-new-bytes 128
 ```
 
-Training logs contain loss, thinking loss, surprise, valid-token count and
-expert activations. Validation loss/perplexity, optimizer steps, learning rate,
-precision and tokens/s are also reported. AdamW, warmup/cosine decay, gradient
-accumulation, label smoothing and AMP are configured through CLI flags. Example
-content is never logged. For variable-length corpora, `--max-batch-tokens` sets
-an optional budget on padded tokens per batch and `--length-bucket-size` keeps
-nearby lengths together. These flags activate the length-aware sampler; without
-them the original DataLoader order and batching path remain in place.
+Every training run reports supervised tokens, thinking tokens, loss, thinking
+loss, validation metrics when configured, perplexity, learning rate, optimizer
+steps, precision, and tokens per second.
 
-## Generate
+## HERM in plain language and in equations
 
-```bash
-.venv/bin/python -m koemi generate \
-  --checkpoint artifacts/koemi-4hcm.pt \
-  --system "Answer in one sentence." \
-  --prompt "Explain FIFO." \
-  --max-new-bytes 64 \
-  --cache-capacity 256 \
-  --mapping-cache D:\\koemi-cache \
-  --mapping-cache-namespace local-session \
-  --mapping-cache-ttl-seconds 3600
+HERM combines four kinds of memory:
+
+1. a bounded recurrent state `h_t` for the running causal chain;
+2. a fast normalized associative memory for repeated patterns;
+3. an optional slower memory for reconstruction residuals;
+4. exact local and surprise-admitted rings for details that should not be
+   compressed immediately.
+
+The causal order is important. The state before the current target is used to
+predict that target. The current token is not allowed to leak into its own loss.
+
+The recurrent update is bounded:
+
+```text
+a_t = eps + (1 - 2 eps) sigmoid(W_a u_t + b_a)
+g_t = (1 - a_t) tanh(W_g u_t + b_g)
+h_t = a_t * h_(t-1) + g_t
 ```
 
-`--prompt` carries the user text alone. The command wraps it in the same role
-markers the trainer wrote, so at inference the model sees the exact byte prefix it
-saw during training. A test asserts that equality directly: the built prompt equals
-the serialized record's bytes up to its first supervised position.
+The fast associative memory receives rank-one writes:
 
-Only the continuation reaches stdout. The prefix the model was conditioned on is
-stripped, and stripping fails loudly rather than silently when the generated text
-does not start with it.
-
-`--prompt-target thinking` ends the prefix at the thinking marker instead of the
-output marker, for a checkpoint trained with thinking spans. `--raw-prompt` sends
-`--prompt` verbatim and prints the whole text, which is what a checkpoint trained
-on plain text needs; combining it with `--system` is refused.
-
-Serving code can call `prefill_batch` for a padded prompt batch and
-`decode_batch` for one-token recurrent steps. `InferenceBatchScheduler` keeps
-prefill and decode queues separate, groups compatible length buckets and
-returns padded tensors plus request handles; the caller owns model execution and
-calls `complete_batch` with outputs and isolated final states.
-
-The RAM cache reuses detached embeddings by token id. The optional mapping cache
-also writes fixed-width state snapshots at scan boundaries and at the end of a
-prompt. A later request restores the longest byte-identical prefix and processes
-only its suffix. Entries use an explicit tenant/session plus checkpoint namespace,
-expire under a sliding TTL and can be cleared only inside that namespace. This is
-exact prefix reuse, not semantic similarity.
-
-`--bulk-prefix-cache PATH` selects the block-backed alternative for generation.
-It stores only complete fixed-token blocks, restores the state at the end of the
-longest exact block, and evaluates the uncached suffix. The block size defaults to
-the checkpoint's `scan_chunk`; `--bulk-prefix-cache-namespace` is required, and
-the mapping and bulk prefix caches cannot be enabled together. RAM/SSD hit
-counters are logged as block probes, not as a claim about request-level speed.
-
-## Decode paths
-
-Three decode paths exist, and `generate` picks one. The default is unchanged.
-
-```bash
-.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-4hcm.pt \
-  --prompt "Explain FIFO." --max-new-bytes 256 --fast-decode --greedy
-
-.venv/bin/python -m koemi generate --checkpoint artifacts/koemi-4hcm.pt \
-  --prompt "Explain FIFO." --max-new-bytes 256 --ngram-draft --draft-length 4
+```text
+B_t = lambda_t * B_(t-1) + w_t * v_t * phi_t^T
+c_t = lambda_t * c_(t-1) + w_t * phi_t
 ```
 
-`--fast-decode` runs the fixed-shape loop: the recurrent rings are held at
-capacity, the decode inputs are marked trusted so the model skips its host-side
-validation, and sampling stays on the device. Add `--cuda-graph` to replay one
-captured CUDA graph per step; it requires `--fast-decode` and a CUDA device.
+The read includes a confidence factor. An empty memory returns low evidence
+instead of turning division by a small epsilon into a large noise signal.
 
-`--ngram-draft` proposes a block from the most recent earlier occurrence of the
-current suffix and verifies the whole block in one windowed forward.
-`--draft-checkpoint PATH` proposes from a smaller model instead. Both log
-`acceptance_rate` and `tokens_per_target_call`; speculation is a loss when
-acceptance collapses, and those two numbers are how you see it.
-
-Neither path accepts a prefix cache, and neither uses the warm embedding cache,
-because both bypass the per-request cache boundary; `--cache-capacity` has no
-effect on them. Design, contracts and the CPU measurements are in
-[`docs/FAST_DECODE_AND_HYBRID_TOKENIZER.md`](docs/FAST_DECODE_AND_HYBRID_TOKENIZER.md).
-
-Serving code can use the same parts directly: `BatchDecoder` for a fixed-shape
-decode loop, `generate_batch` for several prompts at once, and
-`speculative_generate` with `NgramDrafter` or `ModelDrafter`.
-
-## Hybrid tokenizer
-
-A byte is a small unit of text, and the model spends one forward per unit. The
-optional hybrid tokenizer is byte-level BPE: ids `0-255` stay single bytes, `256`
-stays padding, `257-260` are the four span markers, and learned merges start at
-`261`. The byte alphabet gives total coverage, so an unseen character degrades to
-its own bytes instead of to an unknown token.
-
-```bash
-.venv/bin/python -m koemi build-vocabulary \
-  --dataset data/corpus.jsonl --output artifacts/vocabulary.json \
-  --vocabulary-size 8192
-
-.venv/bin/python -m koemi train \
-  --dataset data/corpus.jsonl --vocabulary artifacts/vocabulary.json \
-  --checkpoint artifacts/koemi-hybrid.pt
+```text
+confidence_t = den_t / (den_t + eps_m)
+m_t = confidence_t * (B_(t-1) psi_t / (den_t + eps_m))
 ```
 
-The vocabulary is stored inside the checkpoint, so `generate` needs no extra
-flag. Each record span is encoded separately, so no merged token crosses a span
-marker and the supervised mask stays aligned with the ids.
+The parallel path evaluates bounded scan chunks; the sequential path applies the
+same equations token by token and remains the numerical oracle. Tests compare
+logits, state tensors, and selected gradients across those paths.
 
-An existing byte checkpoint migrates instead of being discarded:
-
-```bash
-.venv/bin/python -m koemi expand-vocabulary \
-  --checkpoint artifacts/koemi-4hcm.pt \
-  --vocabulary artifacts/vocabulary.json \
-  --output artifacts/koemi-hybrid.pt
+```mermaid
+flowchart LR
+    X[Byte or hybrid token] --> E[Embedding + RMSNorm]
+    E --> H[Bounded recurrent state h_t]
+    H --> P[Linear preview]
+    P --> S[Causal surprise]
+    H --> F[Fast associative memory]
+    S --> F
+    F --> R[Residual]
+    R --> L[Optional slow refine memory]
+    H --> Q[Exact local ring]
+    S --> A[Exact salient ring]
+    F --> Z[Typed fusion]
+    L --> Z
+    Q --> Z
+    A --> Z
+    H --> Z
+    Z --> M[Optional deterministic MoE]
+    M --> Y[Byte or hybrid vocabulary head]
 ```
 
-Every existing embedding and head row is copied unchanged; each new row starts at
-the mean of the rows of the bytes it expands to. The migrated checkpoint is a warm
-start, not the same model: surprise is normalized over the content vocabulary, so
-a larger vocabulary changes surprise and therefore the memory writes.
+## Deterministic MoE
 
-## Model identity and release licensing
+The regular HERM MoE path is deliberately predictable. A content hash of the
+current and previous byte selects `expert_top_k` experts. Position is not part
+of the route, so the same bigram receives the same expert set wherever it
+appears.
 
-HERM artifacts can carry a machine-readable `ModelIdentity` with a custom
-heading, organization, model name, version, architecture, variant and
-description. Source, weights and data availability are declared separately, so
-a source-only release can be represented without claiming that its weights are
-open.
+- `--expert-count 0` disables the bank.
+- `--expert-top-k 1` preserves the lowest-cost path.
+- A `128/6` configuration activates six deterministic experts per valid byte.
+- There is no learned router, routing loss, risk head, or semantic-routing
+  claim.
+- Load balance is measured from the run; it is not assumed from the hash.
 
-This header is artifact metadata, not a system prompt and not a guarantee that
-generated text will identify itself. `CheckpointStore` and the immutable
-`CheckpointCatalog` preserve it beside the tensor payload; loading a legacy
-checkpoint without the field remains supported. Behavioral self-identification
-requires training and an evaluation contract.
+The native MoE path is inference-only and stricter than the legacy route: it
+rejects duplicate valid assignments and never routes padding.
+
+## MoE Submapping: keep the bank in storage, move selected blocks
+
+![MoE Submapping and native CUDA explained with wooden counting blocks](assets/koemi-4hcm-wooden-blocks-moe-cuda.png)
+
+The third picture shows the intended physical idea:
+
+1. the full expert bank sits in a validated storage layout;
+2. content routing selects only the required expert/token pairs;
+3. stable permutation groups those pairs by expert;
+4. selected blocks move to the compute tray;
+5. grouped expert work runs and the results are combined back by token row.
+
+`koemi.runtime.moe_submapping` currently provides the safe artifact/storage
+slice, not a production NVMe engine. It writes an immutable manifest, a SHA-256
+sidecar, per-expert/per-tensor blocks, shape/dtype metadata, and block digests.
+The reader rejects unsafe paths, missing blocks, digest mismatches, unsupported
+routing, and malformed tensors. A byte-bounded LRU and bounded prefetch are
+available at the storage boundary.
+
+The normal `KoemiModel` runner was intentionally not changed. There is no
+verified NVMe prefetch, VRAM staging, asynchronous overlap, or end-to-end MoE
+throughput result yet.
+
+## Model identity, custom headings, and licensing
+
+An artifact can identify itself without injecting a system prompt into the token
+stream:
 
 ```python
 from koemi.model.identity import ModelIdentity, ModelLicensing
 
 identity = ModelIdentity(
     organization="Koemi Labs",
-    model_name="Koemi HERM",
+    model_name="Koemi-4HCM",
     version="0.4.0",
-    heading="Koemi HERM by Koemi Labs",
+    heading="Koemi-4HCM by Koemi Labs",
+    architecture="HERM",
     licensing=ModelLicensing(
         source_license="MIT",
         source_availability="open",
-        weights_availability="closed",
+        weights_availability="unknown",
+        data_availability="unknown",
     ),
 )
+
+print(identity.model_id)
+print(identity.render_header())
 ```
 
-Licensing metadata documents intent; it does not grant rights over code,
-weights, datasets or trademarks that the owner does not hold.
+The metadata is stored beside the payload by `CheckpointStore`,
+`CheckpointCatalog`, and the MoE manifest. It does not make generated text say
+the name. Reliable self-identification requires training examples and a
+behavior evaluation. The example above is a declaration format; each real
+weights and data release must select its actual policy.
 
-## Isolated MoE Submapping layout
+For a source-only publication, keep weights and data as `closed` or `unknown`.
+For an open-weights publication, use `weights_availability="open"` together
+with an explicit `weights_license`, for example `"MIT"`. The validator rejects
+an open artifact that has no license.
 
-`koemi.runtime.moe_submapping` is an MoE-only storage slice. It publishes
-immutable, SHA-256-verified expert tensor blocks under a manifest, reads only
-the unique experts selected by the deterministic HERM route, and exposes
-byte-bounded LRU metrics plus bounded prefetch. A manifest can carry the same
-model identity and licensing metadata.
+## Checkpoint recovery
 
-The slice is intentionally separate from the normal model runner. It does not
-change `KoemiModel`, the existing runner, routing precision or `top_k`, and it
-does not claim an SSD or GPU speedup. Current validation is CPU-local; real
-NVMe, VRAM staging, asynchronous overlap and end-to-end model equivalence are
-still acceptance work for a future MoE runner.
+The legacy checkpoint path remains supported. New publications can use the
+immutable catalog:
 
-## Architecture
+```python
+from koemi.training.checkpoint_catalog import CheckpointCatalog
 
-```mermaid
-flowchart LR
-    Input[UTF-8 bytes] --> Embedding
-    Warm[RAM token cache] -.-> Embedding
-    Mapping[Optional SSD mapping/prefix ledger] -. longest exact prefix .-> Recurrent
-    Bulk[Optional RAM/SSD BulkPrefixCache] -. longest complete block .-> Recurrent
-    Embedding --> Recurrent[Bounded recurrent state]
-    Recurrent --> Fast[Fast associative memory]
-    Fast --> Residual[Reconstruction residual]
-    Residual --> Slow[Slow refine memory]
-    Recurrent --> Local[Exact local KV ring]
-    Recurrent --> Salient[Exact surprise-admitted ring]
-    Recurrent --> Surprise[Linear causal surprise]
-    Surprise --> Fast
-    Surprise --> Slow
-    Fast --> Fusion[Linear fusion]
-    Slow --> Fusion
-    Local --> Fusion
-    Salient --> Fusion
-    Recurrent --> Fusion
-    Fusion --> MoE[Optional contextual deterministic MoE]
-    MoE --> Output[Linear byte predictor]
+catalog = CheckpointCatalog("artifacts/koemi-4hcm-catalog", retention=3)
+publication = catalog.publish(
+    {"state_dict": model.state_dict()},
+    identity=identity,
+    metadata={"purpose": "release-candidate"},
+)
+recovery = catalog.recover_latest()
+assert recovery.has_checkpoint
 ```
 
-### Read the system in four diagrams
+Each generation has a manifest, payload size, SHA-256 digest, and
+`weights_only=True` validation. Recovery scans valid generations and reports
+rejected ones instead of trusting one mutable pointer blindly. Multi-writer
+locking, signatures, encryption, and migration of the legacy A100 runner are
+still separate work.
 
-These figures are deliberately operational: each box names a component that
-exists in this repository, and every claim is bounded by the tests and
-measurements documented below.
+## Fast decode, batching, caching, and offload
 
-![Koemi-4HCM HERM ecosystem overview](assets/koemi-3hip-herm-ecosystem.png)
-
-![HERM memory hierarchy and equations](assets/herm-memory-hierarchy.png)
-
-![Koemi-4HCM runtime and prefix reuse](assets/koemi-3hip-runtime.png)
-
-![Current limits and validation plan](assets/koemi-3hip-limits.png)
-
-### HERM memory choices
-
-HERM uses four decisions inspired by the memory perspective in [MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/):
-
-- memory architecture: bounded vector state, fast and slow normalized
-  associative matrices and a fixed local key-value ring;
-- attentional bias: key/query feature similarity and local dot-product recall;
-- retention gate: bounded decay with a learned write gate;
-- memory algorithm: differentiable outer training plus two affine prefix scans.
-
-The current implementation is a research base, not a reimplementation of
-Titans. The Google overview identifies Titans as a concrete architecture and
-MIRAS as the broader framework; Titans uses a deeper online-updated neural
-memory than HERM does.
-
-HERM is not a claim that recurrence has solved long-context intelligence. It is
-an engineering hypothesis: keep the causal state width fixed, combine a learned
-compressed memory with a few exact bounded slots, and measure the trade-off.
-
-### One token, formally
-
-At position `t`, the model performs the following causal sequence. No operation
-uses the target byte that training will score at the next step.
-
-1. Embed the byte and normalize it: `u_t = RMSNorm(Embedding(x_t))`.
-2. Update the bounded recurrent state:
-
-   ```text
-   a_t = eps_a + (1 - 2 eps_a) sigmoid(W_a u_t + b_a)
-   g_t = (1 - a_t) tanh(W_g u_t + b_g)
-   h_t = a_t * h_(t-1) + g_t
-   ```
-
-   `a_t` is constrained to `(eps_a, 1-eps_a)`. The state therefore decays
-   smoothly instead of exploding or being overwritten in one step.
-
-3. Produce memory keys, values, features and a bounded write weight:
-
-   ```text
-   k_t = W_k h_t
-   v_t = W_v h_t
-   phi_t = softmax(W_phi k_t + b_phi)
-   lambda_t = eps_d + (1 - 2 eps_d) sigmoid(W_d h_t + b_d)
-   w_t = sigmoid(W_w h_t + b_w)
-   ```
-
-   Here `phi_t` is a positive feature distribution. The outer product
-   `v_t phi_t^T` writes one rank-one association rather than a full new matrix.
-
-4. Read the previous memory state before writing the current token:
-
-   ```text
-   q_t = W_q h_t
-   psi_t = softmax(W_phi q_t + b_phi)
-   den_t = c_(t-1)^T psi_t
-   raw_t = B_(t-1) psi_t / (den_t + eps_m)
-   confidence_t = den_t / (den_t + eps_m)
-   m_t = confidence_t * raw_t
-   ```
-
-   The denominator is evidence that the query matches stored features. The
-   confidence multiplier makes an empty memory say “no evidence” instead of
-   turning division by `eps_m` into a 256x noise amplifier.
-
-5. Update the fast memory and, when `--ablation herm` is selected, the slow
-   residual memory:
-
-   ```text
-   B_t = lambda_t B_(t-1) + w_t v_t phi_t^T
-   c_t = lambda_t c_(t-1) + w_t phi_t
-   r_t = v_t - m_t
-   ```
-
-   The slow tier applies the same bounded scan to a residual with a slower
-   decay. `no_refine` skips its compute by default; it does not pretend that a
-   zero-cost tier has produced quality.
-
-### Same equations, two audiences
-
-In plain language, HERM keeps a small notebook (`h_t`), compresses repeated
-patterns into a learned index (`B_t, c_t`), stores a slower correction (`R_t`),
-and keeps a few exact recent or surprising details in bounded rings. In linear
-algebra, it is a causal rank-one state-space update with normalized feature
-contractions and no sequence-length-sized persistent state.
-
-The parallel path evaluates a chunk using the closed form
-
-```text
-B_t = Lambda_t B_0 + sum_(s<=t) (Lambda_t/Lambda_s) w_s v_s phi_s^T
-```
-
-and computes all causal query/write interactions through a `[B,C,C]` matrix,
-where `C` is the chunk length. It returns only reads and the final state. The
-sequential path applies the recurrence token by token and remains the oracle.
-`tests/model/test_associative_read.py` and `tests/model/test_execution.py`
-compare both paths, including gradients.
-
-### Exact detail and salience
-
-The local ring retains the latest `W` projected key/value pairs. The salient
-ring admits a token when `surprise_t > tau` and retains the latest `S` admitted
-pairs, even when they are far outside the local window. Both reads are causal:
-the query at `t` can see carried entries and current entries with index `< t`,
-never a future token. `S=16` and `tau=0.75` are implementation defaults, not a
-quality optimum; the required threshold/capacity sweep is still open.
-
-### Training objective and reported numbers
-
-For a supervised target byte `y_t`, the model minimizes causal cross-entropy:
-
-```text
-loss = - (1/N) sum_t log softmax(logits_t)[y_t]
-bpb = loss / log(2)
-perplexity = exp(loss)
-```
-
-Thinking bytes can receive a separate non-negative weight, but visible thinking
-text is not treated as a hidden chain of thought. Every run reports supervised
-token count, thinking-token count, loss, thinking loss, validation loss when
-available, perplexity, learning rate, optimizer steps, precision and tokens/s.
-
-### Hardware, RAM and SSD responsibilities
-
-- CPU/GPU tensors execute the model. The CPU path remains the locally measured
-  oracle; four opt-in native CUDA operator slices have separate A100 evidence,
-  but the default runner and end-to-end training path are not promoted to them.
-- RAM holds active parameters and the fixed-width `KoemiState`. A state does not
-  grow with conversation length.
-- The RAM warm cache stores detached embeddings by token id. It is disabled in
-  training because optimizer updates would make detached values stale.
-- The opt-in SSD prefix ledger stores tensor-only snapshots at scan boundaries.
-  A request finds the longest byte-identical prefix, restores its state and runs
-  only the suffix. This is exact reuse, not semantic retrieval.
-- Parameter offload has accelerator, host and disk tiers. Disk saves memory but
-  adds I/O; it is not a speed optimization. Frozen parameters are required for
-  the disk tier.
-
-### What Koemi is — and is not
-
-Koemi-4HCM is an ambitious research implementation with executable contracts,
-not a Transformer replacement today. It currently provides a bounded causal
-state, associative and exact memory paths, deterministic runtime behavior,
-prefix reuse, reproducible CPU measurements and measured native CUDA operator
-slices. It does not yet establish Transformer-level quality, arbitrary
-long-context recall, end-to-end CUDA/FP16 speed, or a quality gain from
-salience. Those are explicit experiments, not implied claims.
-
-For positive features `phi`, the fast tier computes an epsilon-regularized read
-and multiplies it by
-`confidence = denominator / (denominator + epsilon)`. It updates with
-`B_t = lambda_t B_(t-1) + w_t v_t phi(k_t)^T`. The slow tier receives the
-bounded reconstruction residual `v_t - read_fast_t`, decays more slowly with
-`lambda_s = 1 - (1 - lambda_t) rho`, and writes only in proportion to causal
-surprise and local novelty when `--ablation herm` is selected. The parallel read
-keeps the rank-one factors and contracts them through a causal `[B,C,C]` matrix;
-it does not materialize `[B,L,d,m]` basis states.
-
-### Surprise and chains
-
-The previous recurrent state predicts the observed byte. Surprise is
-`1 - exp(-NLL/log(256))`; it scales memory writes but never selects an execution
-path. A carried `KoemiState` is the chain between generation steps; resetting it
-starts a new session.
-
-### Contextual deterministic MoE
-
-When `--expert-count` is greater than zero, a mixing hash of the current byte and
-the previous byte selects `--expert-top-k` experts (one by default). The selected
-expert updates are averaged before normalization. There is no risk head, routing
-projection or routing loss. It is not learned semantic routing, but the assignment
-is a reproducible function of content alone, so a bigram receives the same expert
-set every time it appears.
-
-Absolute position used to enter the hash, which made the dispatch a random
-partition: the same bigram went to a different expert at every position, so no
-expert could accumulate a coherent token set. Measured on 26,036 bytes of this
-repository's prose, chi-square per degree of freedom was 1.10 at 64 experts, which
-is indistinguishable from uniform random; a 64-expert run on real data reported
-0.92. Dispatch on content alone gives 161.08, so the assignment now carries
-information. No expert is left idle and every expert receives between 10 and 29
-distinct bigrams. The busiest expert holds 3.3 times the uniform share; that skew
-is the skew of byte-bigram frequency. With `--expert-top-k 1`, every valid token
-passes through exactly one expert. A
-`128/6` run is an explicit high-capacity experiment: six deterministic experts are
-active per token and all 128 experts are trainable. It is not the default and its
-load balance must be measured rather than assumed.
-
-The hash mixes its bits instead of combining terms linearly. The previous form was
-affine, so `remainder(expert_count)` saw only the low bits: with consecutive bytes,
-where the previous byte is one less than the current one, it reached 1 expert of 4
-and 16 of 64. The mixing form reaches 4 of 4 and 63 of 64.
-
-## Experimental optimization fronts
-
-The repository also contains opt-in optimization seams in
-[`docs/HERM_OPTIMIZATION_LAB.md`](docs/HERM_OPTIMIZATION_LAB.md). They remain
-outside the default `KoemiModel` and trainer until hardware and quality gates
-are measured. `BulkPrefixCache` is available only when generation explicitly
-selects it:
-
-| Front | Current contract | Boundary |
-| --- | --- | --- |
-| CUDA and state | CUDA affine-scan backend, reusable state buffers, AMP/TF32 policy | Native `.cu` fronts exist for core, dense, think and MoE; they are opt-in and have operator-level A100 evidence only |
-| Native CUDA slices | `src/koemi/cuda_kernels/` with `tests/cuda/` | Core, dense and think have A100 microbenchmarks; MoE has contract evidence without end-to-end throughput |
-| Context | Multi-rate summary, exact prefix index, causal bounded admission | Summary is lossy; exact stores never perform semantic reuse |
-| Batching and bulk | Length-aware training sampler, prefill/decode APIs, inference scheduler, exact RAM/SSD blocks, `BulkPrefixCache`, bounded async enqueue | Bulk and scheduling remain opt-in; scheduler execution remains caller-owned; no end-to-end throughput claim |
-
-The local verification is CPU-only: the complete suite passes with conditional
-CUDA skips. A separate A100 harness compiled and contract-checked the native
-extensions, and measured selected operator shapes. This does not claim that a
-GPU, CPU thread, RAM cache or SSD will overlap usefully for every workload.
-
-## Parameter offload
-
-Offload moves parameters off the compute device by how much arithmetic their
-residency actually buys. The ranking is measured, not declared: one calibration
-forward records how many token-rows reach each module, `FLOPs / parameter byte`
-follows from the module type and those rows, and the budget is filled from the
-top down.
-
-That metric puts the parts in the order you would expect and for a stated reason.
-The byte predictor is reached twice per forward, once for the logits and once for
-the surprise preview, so it ranks first. The memory and fusion projections see
-every token, so they come next. An expert sees only the tokens its dispatch sent
-it, so a wider bank ranks lower per expert. The embedding table performs a gather
-and no arithmetic at all, so it ranks last: keeping it resident buys no compute.
-
-Three tiers, in fill order:
-
-| Tier | Where the parameter lives | Trainable | Cost per forward |
-| --- | --- | --- | --- |
-| `accelerator` | compute device | yes | none |
-| `host` | host memory, copied per forward | yes | one host-to-device copy |
-| `disk` | storage, read per forward | no, must be frozen | one file read |
+The default decode path is unchanged. Opt in explicitly when the workload and
+checkpoint justify it:
 
 ```bash
-.venv/bin/python -m koemi train \
+python -m koemi generate \
+  --checkpoint artifacts/koemi-4hcm.pt \
+  --prompt "Explain FIFO." \
+  --max-new-bytes 256 \
+  --fast-decode \
+  --greedy
+
+python -m koemi generate \
+  --checkpoint artifacts/koemi-4hcm.pt \
+  --prompt "Explain FIFO." \
+  --max-new-bytes 256 \
+  --ngram-draft \
+  --draft-length 4 \
+  --greedy
+```
+
+Available runtime pieces include:
+
+- `BatchDecoder` and `generate_batch` for fixed-shape or batched decode;
+- prefill/decode queues with length buckets and padded-token accounting;
+- `BulkPrefixCache` for exact complete-token blocks in RAM or SSD;
+- exact longest-prefix state reuse, never semantic similarity search;
+- n-gram and model drafters with explicit acceptance statistics;
+- CUDA graph capture only when shapes, addresses, and device constraints allow;
+- accelerator, host, and disk parameter tiers with `offload_plan` logs.
+
+Disk offload trades memory for I/O. Frozen parameters are required for the disk
+tier; offloading is a capacity mechanism, not a blanket speed claim.
+
+```bash
+python -m koemi train \
   --dataset examples/canonical.jsonl \
-  --checkpoint artifacts/koemi.pt \
+  --checkpoint artifacts/koemi-offload.pt \
   --offload-accelerator-mib 512 \
   --offload-host-mib 2048 \
   --overwrite
 
-.venv/bin/python -m koemi generate \
-  --checkpoint artifacts/koemi.pt \
+python -m koemi generate \
+  --checkpoint artifacts/koemi-offload.pt \
   --prompt "FIFO means" \
   --offload-accelerator-mib 0 \
   --offload-host-mib 0 \
   --offload-store artifacts/offload-weights
 ```
 
-The host tier keeps the parameter as the autograd leaf. A hook running immediately
-before the module's forward lends it a copy on the compute device and takes the
-copy back afterwards, so the gradient lands on the host leaf and the optimizer
-needs no change. Logits and gradients are bit-exact against a fully resident
-model, and a test asserts it with `torch.equal`. On a host with no accelerator the
-copy is the identity, so the mechanism runs but the transfer it exists for cannot
-be measured here.
+## Hybrid tokenizer
 
-The disk tier refuses a parameter that still requires a gradient, with the module
-and parameter named in the error. That restriction is the honest one: a weight the
-optimizer updates cannot be thrown away after every forward. It also describes the
-case it is built for, a finetune over a frozen base, and inference.
+The byte path is always available. The hybrid tokenizer keeps byte ids for the
+base alphabet, reserves padding and role markers, then learns BPE-style merges
+from a corpus. It reduces the number of positions for frequent pieces but
+changes the vocabulary head, so it requires migration and further training.
 
-Disk offload buys memory with time, and the log says how much.
-`--offload-residency-mib` puts a bounded read cache in front of the store, evicting
-by least recent use, and turns the repeated reads into one read per parameter.
+```bash
+python -m koemi build-vocabulary \
+  --dataset examples/canonical.jsonl \
+  --output artifacts/vocabulary.json \
+  --vocabulary-size 8192
 
-Generating 24 bytes from a 111,024-byte model with every module on the disk tier:
+python -m koemi expand-vocabulary \
+  --checkpoint artifacts/koemi-4hcm.pt \
+  --vocabulary artifacts/vocabulary.json \
+  --output artifacts/koemi-4hcm-hybrid.pt
+```
 
-| Residency budget | Store reads | Bytes read | Seconds in reads | Cache hits |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 MiB | 925 | 3,778,900 | 2.1926 | 0 |
-| 1 MiB | 921 | 110,896 | 0.2017 | 892 |
+The A100 runner is byte-only because its materialized stream is stored as
+`bytes`; hybrid training currently goes through the general CLI trainer.
 
-Without the cache the run read 34 times the parameter footprint. With 1 MiB it read
-each parameter once: 34.1 times fewer bytes and 10.9 times less time inside reads.
-The cache lives in host memory, so the budget is the memory you are trading back
-for speed; leave it at zero when the point is to hold nothing resident.
+## Configuration reference
 
-Use the disk tier when the model does not fit, not to make it faster.
-
-Every run logs `offload_plan` with the bytes and module count per tier and the
-materialization counters, so a plan can be checked against the machine it ran on.
-
-## Configuration
+The CLI keeps the byte path as the compatibility default. These are the knobs
+that change model shape, memory behavior, batching, or generation cost; run
+`python -m koemi train --help` and `python -m koemi generate --help` for the
+complete parser surface.
 
 | Option | Default | Effect |
 | --- | ---: | --- |
-| `--embedding-size` | `64` | Width of token embeddings and recurrent state. |
-| `--memory-features` | `16` | Width of associative memory features. |
-| `--local-memory-size` | `16` | Number of exact local key-value slots. |
-| `--salience-memory-size` | `16` | Number of exact surprise-admitted slots. |
-| `--salience-threshold` | `0.75` | Causal surprise required for salient admission. |
-| `--expert-count` | `0` | Context-hash expert count; zero disables MoE. |
-| `--expert-top-k` | `1` | Number of deterministic experts active per valid token. |
-| `--cache-capacity` | `256` | Maximum RAM token embeddings. |
-| `--scan-chunk` | `128` | Sequence bucket used by the parallel path. |
-| `--refine-decay-rate` | `0.0625` | Slow-memory timescale relative to fast decay. |
-| `--offload-accelerator-mib` | unlimited | Parameter budget kept on the compute device. |
-| `--offload-host-mib` | unlimited | Parameter budget streamed from host memory. |
-| `--offload-store` | none | Directory for parameters evicted to storage. |
-| `--offload-residency-mib` | `0` | Read cache in front of the offload store. |
-| `--system` | none | System text placed before the user text at inference. |
-| `--prompt-target` | `answer` | `answer` or `thinking`: which span the model continues. |
-| `--raw-prompt` | off | Send `--prompt` verbatim, without the role markers. |
-| `--thinking-loss-weight` | `1.0` | Relative weight of supervised thinking bytes. |
-| `--gradient-accumulation-steps` | `1` | Microbatches per optimizer update. |
-| `--precision` | `auto` | FP32 on CPU; BF16 or FP16 AMP on supported CUDA. |
-| `--validation-fraction` | `0.0` | Deterministic record-level holdout fraction. |
-| `--num-workers` | `0` | DataLoader worker processes. |
-| `--max-batch-tokens` | none | Optional maximum padded tokens per training batch. |
-| `--length-bucket-size` | none | Optional sequence-length bucket width for training batches. |
-| `--ablation` | `no_refine` | Fast tier by default; `herm` enables refine, with `no_surprise` and `affine` controls. |
-| `--device` | CUDA if available | PyTorch device used for training or generation. |
-| `--execution-mode` | `parallel` | `parallel` scan or sequential correctness path. |
+| `--embedding-size` | `64` | Width of embeddings and recurrent state. |
+| `--memory-features` | `16` | Feature width of associative memories. |
+| `--local-memory-size` | `16` | Exact recent key-value slots. |
+| `--salience-memory-size` | `16` | Exact surprise-admitted slots. |
+| `--salience-threshold` | `0.75` | Surprise required for salient admission. |
+| `--expert-count` | `0` | Deterministic expert count; zero disables the bank. |
+| `--expert-top-k` | `1` | Experts active per valid token. |
+| `--scan-chunk` | `128` | Sequence window used by the parallel scan. |
+| `--refine-decay-rate` | `0.0625` | Timescale of the slower refine memory. |
+| `--ablation` | `no_refine` | `herm`, `no_refine`, `no_surprise`, or `affine`. |
+| `--execution-mode` | `parallel` | Parallel scan or sequential numerical oracle. |
+| `--thinking-loss-weight` | `1.0` | Relative loss weight for thinking bytes. |
+| `--max-batch-tokens` | unset | Upper bound on padded tokens per training batch. |
+| `--length-bucket-size` | unset | Groups nearby sequence lengths during training. |
+| `--precision` | `auto` | FP32 on CPU; BF16/FP16 AMP where supported. |
+| `--validation-fraction` | `0.0` | Deterministic record-level validation holdout. |
+| `--cache-capacity` | `256` | RAM token-embedding cache capacity. |
+| `--mapping-cache` | unset | SSD directory for exact inference state mappings. |
+| `--bulk-prefix-cache` | unset | RAM/SSD cache for complete exact-token blocks. |
+| `--fast-decode` | off | Fixed-shape decode with fewer host synchronizations. |
+| `--cuda-graph` | off | Replays a captured CUDA graph; requires fast decode and CUDA. |
+| `--ngram-draft` | off | Proposes repeated-context blocks for verification. |
+| `--draft-checkpoint` | unset | Smaller model that proposes speculative blocks. |
+| `--offload-accelerator-mib` | unset | Parameter budget resident on the accelerator. |
+| `--offload-host-mib` | unset | Parameter budget streamed from host memory. |
+| `--offload-store` | unset | Directory for evicted parameter files. |
+| `--offload-residency-mib` | `0` | Host read cache in front of the offload store. |
 
-## Benchmark
+`--mapping-cache` and `--bulk-prefix-cache` are exact byte/token-prefix reuse,
+not semantic retrieval. Cache namespaces are required for persistent mappings,
+and the two cache implementations cannot be enabled together.
 
-`benchmarks/run_decode_benchmark.py` times the decode paths against each other on
-one device and writes a JSON report. It compares the baseline loop, fast decode,
-n-gram speculation and, when a draft checkpoint or `--synthetic-draft` is given,
-model speculation; the CUDA graph path is added only when CUDA is present.
+## Native CUDA fronts
 
-```bash
-.venv/bin/python benchmarks/run_decode_benchmark.py \
-  --checkpoint artifacts/koemi-4hcm.pt --device cuda \
-  --max-new-tokens 256 --report artifacts/decode.json
-```
+The CUDA code is opt-in and isolated under
+[`src/koemi/cuda_kernels/`](src/koemi/cuda_kernels/). Conditional contracts are
+under [`tests/cuda/`](tests/cuda/). The normal `KoemiModel` path was not changed
+to silently select these extensions.
 
-The ready-to-run English analysis notebook is
-[`notebooks/Koemi-3HIP_Analysis.ipynb`](notebooks/Koemi-3HIP_Analysis.ipynb). It
-contains the bounded causal evaluator, explicit answer/thinking denominators,
-moving-median curves and a monochrome pastel-yellow report style. Point
-`RUN_LOG` at a JSONL training log after a run; missing series are reported as
-missing rather than fabricated.
+| Front | What it does | Current evidence |
+| --- | --- | --- |
+| `core` | Fused RMSNorm + SiLU forward/backward | A100 microbenchmark: `0.01280 ms` native vs `0.09078 ms` reference |
+| `dense` | Affine scan forward/backward | A100 microbenchmark: `0.06277 ms` native vs `8.47729 ms` sequential reference |
+| `think` | Causal surprise forward/backward | Forward `0.04321 ms` vs `0.37970 ms`; backward `0.09400 ms` vs `0.56842 ms` |
+| `moe` | Route, stable permutation, grouped expert MLP, combine | Compiled and contract-checked; no end-to-end throughput or backward claim |
 
-For an overnight Colab T4 run, use
-[`notebooks/Koemi-3HIP_T4_Overnight.ipynb`](notebooks/Koemi-3HIP_T4_Overnight.ipynb).
-It streams the English conversational `HuggingFaceTB/smol-smoltalk` dataset,
-trains the explicit `128 experts / 6 active` deterministic MoE for five wall-clock
-hours, resumes from checkpoints, and exports loss/BPB, perplexity, throughput,
-GPU memory, surprise and expert-load evidence. The dataset card is the source of
-the license and corpus claims: https://huggingface.co/datasets/HuggingFaceTB/smol-smoltalk.
+The think fast path uses ATen CUDA GEMM, custom warp-shuffle reductions, a
+coalesced logits-gradient kernel, GEMMs for parameter gradients, and a bias
+reduction. It materializes a float logits matrix, so it is not a standalone
+fully fused custom GEMM.
 
-For a nine-hour Colab Pro A100 run, use
-[`notebooks/Koemi-3HIP_A100.ipynb`](notebooks/Koemi-3HIP_A100.ipynb). The notebook
-pins its source revision, runs local contract tests before downloading
-data, mounts Google Drive for resumable rotating checkpoints, and calibrates the
-microbatch against the detected A100. Its default 0.205B-parameter configuration
-uses BF16 autocast, TF32 matmuls, 128 deterministic experts with 6 active per
-token, and a 64-example effective batch. The corpus builder keeps verified
-English coding records from OpenCodeInstruct, CodeFeedback, and Magicoder, then
-adds Math-Verify-complete OpenR1 traces with separate thinking and answer loss.
-Terminal-Bench and BigCodeBench remain evaluation-only and are not downloaded by
-the training cell. Dataset revisions, quotas, checkpoint format, and known limits
-are recorded in [`docs/A100_CODE_REASONING_TRAINING.md`](docs/A100_CODE_REASONING_TRAINING.md).
+The A100 verification environment was `NVIDIA A100-SXM4-40GB`, compute
+capability 8.0, PyTorch `2.11.0+cu128`, and CUDA `12.8`. These are operator
+microbenchmarks, not proof of end-to-end training or serving speed.
 
-For a bounded paid run without a large notebook payload, use the conservative
-Python launcher in [`docs/A100_SAFE_TRAINING.md`](docs/A100_SAFE_TRAINING.md).
-It separates local planning, a small real-A100 forward/backward preflight, and
-the explicitly confirmed training session. Its default target is the existing
-approximately 0.205B-parameter model with 45,000 code-focused records across
-25 resumable 7.5-hour sessions.
+## A100 training and Colab retrying
 
-For maximum A100 utilization, the same launcher supports
-`--profile aggressive`: approximately 1.035B parameters, 128 experts/top-6,
-sequence 512, 200,000 bounded records and GPU-measured microbatch calibration.
-Run its separate plan and preflight before training; `BulkPrefixCache` remains
-inference-only because skipping exact training prefixes would skip gradients.
+There are two bounded training profiles:
+
+- **safe**: approximately `0.205B` parameters, width `512`, 128 experts,
+  top-6, 45,000 code-focused records, 25 resumable sessions;
+- **aggressive**: approximately `1.035B` parameters, width `1,152`, sequence
+  length `512`, 128 experts, top-6, 200,000 bounded records and measured
+  microbatch calibration.
+
+Always run plan, preflight, and explicit budget confirmation before a paid run:
 
 ```bash
-.venv/bin/python benchmarks/run_benchmark.py --task bytes --report artifacts/bench-bytes-koemi-4hcm.json
-.venv/bin/python benchmarks/run_benchmark.py --task recall --report artifacts/bench-recall-koemi-4hcm.json
-.venv/bin/python benchmarks/run_ablation.py --task recall --seeds 17 29 41 --train-records 1024 --evaluation-records 1024 --epochs 4 --report artifacts/ablation-recall.json
+python -m koemi.training.a100_safe_run --mode plan \
+  --results-dir /content/drive/MyDrive/koemi-a100-safe-v1
+
+python -m koemi.training.a100_safe_run --mode preflight \
+  --results-dir /content/drive/MyDrive/koemi-a100-safe-v1
+
+python -m koemi.training.a100_safe_run --mode train \
+  --results-dir /content/drive/MyDrive/koemi-a100-safe-v1 \
+  --confirm-budget-hours 188
 ```
 
-The harness compares Koemi-4HCM with parameter-matched GRU and LSTM baselines. The
-old Koemi-1FPA measurements remain archived in [`docs/BENCHMARK.md`](docs/BENCHMARK.md)
-and are not Koemi-4HCM results. The ablation runner requires at least three seeds and
-reports mean and standard deviation. The affine control is the minimum quality
-baseline; a small-budget single-seed run is not evidence of memory capacity.
+For the aggressive profile, add `--profile aggressive` to all three commands
+and use a separate Drive directory. The preflight must report the expected GPU,
+finite loss, finite gradients, and a completed optimizer step.
 
-### Legacy training, before Koemi became HIP
+The [`.colab_run_existing.py`](.colab_run_existing.py) harness reconnects a
+fresh MCP client after a browser-bridge or runtime transition. Its retry policy
+is bounded by:
 
-The following plot belongs to the pre-HIP training line. It is preserved as a
-historical record, not presented as current Koemi-4HCM evidence:
+```text
+KOEMI_MCP_RETRIES
+KOEMI_MCP_RETRY_DELAY
+KOEMI_MCP_RETRY_MAX_DELAY
+```
 
-![Legacy pre-HIP training curves](assets/legacy-pre-hip-training-curves.png)
+Remote failures are reported as harness failures; they are not silently
+classified as a disconnected bridge.
 
-The old run shows loss decreasing while answer BPB remains noisy and throughput
-oscillates during training. It is useful for understanding where the project
-came from; it does not measure the current prefix ledger, rank-one chunk read,
-confidence gate or salient ring.
+### Training evidence in the supplied log
 
-## Known limitations
+The supplied aggressive A100 log recorded snapshots from optimizer steps
+`18,700` through `18,800`:
 
-- Checkpoint format 7 adds the salient fusion input. Formats 5 and 6 are refused
-  because their expert partition or fusion weights describe a different model.
-- Contextual deterministic experts are not learned semantic routing. Learned
-  expert selection would reintroduce a router, contrary to this architecture.
-- The role markers are reserved. A dataset span or an inference prompt carrying
-  `<|system|>`, `<|input|>`, `<|thinking|>` or `<|output|>` is refused at the
-  boundary, naming the field and the tag, because forged text would otherwise move
-  a span boundary. A byte vocabulary has no room for dedicated control tokens; the
-  hybrid vocabulary gives each marker one id but keeps the same refusal, since the
-  check protects the span boundary rather than the encoding. `--raw-prompt`
-  bypasses it for a checkpoint that was never trained with markers.
-- The offload store writes parameter files outside the checkpoint. Point
-  `--offload-store` at a private directory: the files are plain weights and no
-  namespace or expiry protects them.
-- The disk cache reuses byte-identical prefixes only; a similar question needs
-  retrieval and a similarity contract outside this phase.
-- Disk entries contain recurrent state and final logits and can encode prompt
-  content.
-  The cache is opt-in, requires an explicit namespace and provides TTL,
-  namespace-local deletion and size/capacity limits. Payload encryption is not
-  provided.
-- SSD storage avoids recomputing an exact cached sequence but cannot replace
-  GPU or RAM for arbitrary active computation; I/O latency can dominate on an
-  HDD.
-- There is no `asyncio` cognition scheduler or arbitrary layer offload. HERM's
-  concurrency is tensor-level parallelism inside the causal scan window.
-- The associative tier and optional refine tier may still lose multi-key
-  interactions. MQAR and long-context recall are still required.
-- UTF-8 byte tokenization uses more positions than a learned tokenizer. The
-  hybrid vocabulary closes that gap but changes the head, so a byte checkpoint
-  needs `expand-vocabulary` and further training; no quality ablation compares the
-  two vocabularies at matched compute.
-- The A100 runner in `src/koemi/training/a100_run.py` stores its token streams as
-  `bytes` and is byte-only. Hybrid training runs through the CLI trainer.
-- Fast decode and speculative decoding are measured on CPU only. The CUDA graph
-  path has tests that skip without a device, and the benchmark reports it only
-  when CUDA is present. Speculation loses when acceptance collapses; the reported
-  acceptance rate is the number that decides it, and no acceptance rate has been
-  measured on a trained checkpoint.
-- Speculative decoding handles one sequence at a time. Batched speculation needs
-  ragged acceptance handling that is unavailable in this phase.
-- No Triton kernel, distributed training, semantic retrieval, persistent
-  episodic memory or tool use exists.
-- The optimization lab provides opt-in CUDA, context and batching seams. The
-  exact `BulkPrefixCache` path and prefill/decode API are connected to explicit
-  generation callers, and the length-aware sampler is available through the two
-  training flags, but none changes the default model or loader path. Native CUDA
-  operator fronts are compiled and measured on the A100 harness, but are not
-  integrated into the default model or loader path. Static expert dispatch is
-  inference-only while autograd and offload retain the reference path for
-  bit-exact contracts. This CPU-only host has not measured CUDA overlap,
-  end-to-end batching gain or context quality; the remote operator measurements
-  do not establish an end-to-end model gain. Exact SSD block payloads are not
-  encrypted.
-- The new `ModelIdentity` metadata does not make a model self-identify in
-  generated text. That behavior needs trained examples and a behavior test;
-  source, weights and data licenses also require separate legal review.
-- `CheckpointCatalog` is an opt-in immutable catalog with payload hashes and
-  `weights_only=True` recovery. The legacy training runners are not migrated to
-  it in this phase, and multi-writer locking, signatures and encryption remain
-  open.
-- The isolated MoE Submapping slice publishes per-tensor blocks, not a proven
-  production cube/mmap engine. It has no current `KoemiModel` integration and
-  no verified NVMe, GPU, prefetch-overlap or throughput result.
+| Metric | Observed range | Last snapshot |
+| --- | ---: | ---: |
+| Tokens seen | `456,175,358` to `458,615,359` | `458,615,359` |
+| Loss | `0.5128` to `0.5844` nats | `0.5844` |
+| Perplexity | `1.6700` to `1.7939` | `1.7939` |
+| Answer BPB | `0.6136` to `0.6580` | `0.6136` |
+| Thinking BPB | `1.0821` to `1.1901` | `1.1901` |
+| Supervised throughput | `23,484` to `30,211` tokens/s | `30,211` |
+| Peak GPU allocation | `33,727,177,216` bytes | `33,727,177,216` |
+
+All 128 experts were occupied in the recorded snapshots. Normalized routing
+entropy was `0.9810` to `0.9856`, and load Gini was `0.2068` to `0.2371`.
+These numbers describe routing distribution, not semantic expert specialization.
+The exported checkpoint named by the log is not independently verified or
+shipped by this repository.
+
+## Benchmarks and verification
+
+Run the local suite:
+
+```bash
+python -m unittest discover -s tests -p "test*.py"
+python -m compileall -q src benchmarks tests
+```
+
+The release preparation passed `548` tests with `16` conditional CUDA skips.
+The local host is CPU-only, so local tests prove contracts and fallback behavior,
+not GPU throughput.
+
+Decode comparison:
+
+```bash
+python benchmarks/run_decode_benchmark.py \
+  --checkpoint artifacts/koemi-4hcm.pt \
+  --device cuda \
+  --max-new-tokens 256 \
+  --report artifacts/decode.json
+```
+
+Model comparison and ablation:
+
+```bash
+python benchmarks/run_benchmark.py \
+  --task bytes \
+  --report artifacts/bench-bytes-koemi-4hcm.json
+
+python benchmarks/run_benchmark.py \
+  --task recall \
+  --report artifacts/bench-recall-koemi-4hcm.json
+
+python benchmarks/run_ablation.py \
+  --task recall \
+  --seeds 17 29 41 \
+  --train-records 1024 \
+  --evaluation-records 1024 \
+  --epochs 4 \
+  --report artifacts/ablation-recall.json
+```
+
+The benchmark harness compares against parameter-matched GRU and LSTM controls.
+Small single-seed or overfit runs are schema checks, not evidence of general
+model quality.
+
+## What is deliberately not claimed
+
+- Koemi-4HCM is not presented as a Transformer replacement or a quality win.
+- Native CUDA fronts are not integrated into the default runner.
+- A100 operator speed is not the same as end-to-end model speed.
+- The think front is not a fully fused custom GEMM.
+- The MoE Submapping slice is not yet a production cube/mmap/NVMe engine.
+- MoE native kernels are inference-only and have no backward path yet.
+- Learned semantic routing, distributed training, Triton kernels, semantic
+  retrieval, persistent episodic memory, and tool use are outside this release.
+- The identity header does not teach a model to say its own name.
+- SSD exact-prefix reuse is not semantic retrieval and disk offload is not a
+  universal speed optimization.
+- The supplied training log does not prove that its exported weights are
+  available in this repository.
 
 ## Project layout
 
 ```text
 src/koemi/
-  configuration/  Model and training settings
-  data/           JSON validation, adapters, serialization, byte and hybrid tokenizers
-  model/          HERM state, memory, cache, scan, CUDA seams and deterministic MoE
-  runtime/        parameter offload, inference batching, bulk blocks, prefix cache, async enqueue, fast decode, serving and MoE Submapping
-  training/       Causal chunks, objective, trainer, batching plan, checkpoint catalog, vocabulary expansion and generation
-benchmarks/       Koemi-4HCM against parameter-matched GRU and LSTM baselines, plus the decode path comparison
-tests/            Data, model, cache, execution and training contracts
-examples/         Valid JSON and JSONL inputs
-```
-
-## Test
-
-```bash
-.venv/bin/python -m unittest discover -s tests -v
+  configuration/  model and training settings
+  data/           validation, adapters, serialization, byte and hybrid tokenizers
+  model/          HERM state, memory, cache, scan, precision, identity and MoE
+  cuda_kernels/   isolated native CUDA fronts for core, dense, think and MoE
+  runtime/        batching, blocks, prefix cache, offload, decode, serving, Submapping
+  training/       datasets, objective, trainer, checkpoints, catalog and A100 runners
+benchmarks/       decode, model comparison, dispatch and ablation harnesses
+tests/            data, model, runtime, training and conditional CUDA contracts
+docs/             architecture, release, training, licensing and optimization notes
+notebooks/        legacy 3HIP analysis/T4/A100 Colab paths kept for provenance
+assets/           technical diagrams and the 4HCM wooden-block explainers
+examples/         canonical JSON and JSONL inputs
 ```
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE).
+This source repository is licensed under the [MIT License](LICENSE). The MIT
+license applies to the repository code. It does not automatically grant rights
+to external training data, third-party datasets, trained weights, or trademarks.
