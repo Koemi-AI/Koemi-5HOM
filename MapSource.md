@@ -2786,18 +2786,40 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   histogram counting uses the CUDA-supported 64-bit atomic form, and the
   remote build creates each extension directory before acquiring its lock.
 
+### 2026-09-18 - Think CUDA fast GEMM and reduction path
+
+- Replaced the think forward's per-vocabulary dot-product loop with a CUDA
+  GEMM followed by a coalesced custom CUDA log-sum-exp/surprise reduction using
+  warp shuffles and an eight-float block workspace.
+- Replaced the backward path's global `atomicAdd` accumulation with a coalesced
+  logits-gradient kernel followed by CUDA GEMMs for prior and weight gradients
+  and a reduction for bias. The original runner remains untouched.
+- On the A100 harness shape `[4, 64, 128]` with vocabulary `1024`, forward
+  measured `0.04321 ms` versus the PyTorch reference `0.37970 ms` (ratio
+  `0.1138`), and backward measured `0.09400 ms` versus the explicit reference
+  `0.56842 ms` (ratio `0.1654`). Think forward/backward, causal-mask and full
+  harness checks passed, followed by `KOEMI_REMOTE_DONE`.
+- The fast path uses PyTorch's CUDA GEMM through ATen and materializes a float
+  logits matrix; it is not a standalone fused matrix-multiply kernel. The
+  measured result is an operator benchmark, not an end-to-end model claim.
+
 ### Open risks introduced by the A100 verification
 
 - KOEMI-059 - `src/koemi/cuda_kernels/think/surprise_kernel.cu:1-250` -
-  condition: the measured think kernel is `1.6979x` the PyTorch reference
-  latency for the tested `4x64x1024x128` shape; impact: the native kernel is
-  not a universal acceleration and needs a profile-guided redesign before
-  default integration; severity: medium; status: open.
+  condition: the redesigned think path measured `0.1138x` the PyTorch reference
+  for forward and `0.1654x` for backward on one A100 shape; impact: larger
+  shapes, mixed dtypes and end-to-end model integration remain unproven;
+  severity: medium; status: mitigated.
 - KOEMI-060 - `.colab_run_existing.py:60-90` - condition: the retry harness
   installs an unpinned `ninja` package from PyPI when the ephemeral Colab
   runtime lacks it; impact: remote build reproducibility and supply-chain
   provenance are weaker than a pinned, prebuilt environment; severity: low;
   status: open.
+- KOEMI-061 - `src/koemi/cuda_kernels/think/surprise_kernel.cu:190-260` -
+  condition: the optimized path delegates matrix products to ATen CUDA GEMM
+  and materializes `[rows, vocab]` float logits; impact: peak memory and
+  standalone-kernel portability are weaker than a fully fused custom GEMM;
+  severity: medium; status: open.
 
 ### Open risks introduced by this block
 

@@ -203,6 +203,28 @@ def surprise_reference(prior, weight, bias, targets, valid):
     return torch.where(valid, surprise, torch.zeros_like(surprise)).to(prior.dtype)
 
 
+def surprise_backward_reference(prior, weight, bias, targets, valid, upstream):
+    prior_float = prior.float()
+    weight_float = weight.float()
+    logits = prior_float @ weight_float.transpose(0, 1) + bias.float()
+    log_partition = torch.logsumexp(logits, dim=-1)
+    target_logits = logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    nll = log_partition - target_logits
+    log_vocab = torch.log(torch.tensor(float(weight.shape[0]), device=prior.device))
+    gradient_nll = upstream.float() * torch.exp(-nll / log_vocab) / log_vocab
+    probabilities = torch.softmax(logits, dim=-1)
+    target_indicator = torch.zeros_like(logits).scatter_(-1, targets.unsqueeze(-1), 1.0)
+    logit_gradient = gradient_nll.unsqueeze(-1) * (probabilities - target_indicator)
+    logit_gradient = logit_gradient * valid.unsqueeze(-1)
+    flat_logit_gradient = logit_gradient.reshape(-1, weight.shape[0])
+    flat_prior = prior_float.reshape(-1, prior.shape[-1])
+    return (
+        (logit_gradient @ weight_float).to(torch.float32),
+        flat_logit_gradient.transpose(0, 1) @ flat_prior,
+        flat_logit_gradient.sum(dim=0),
+    )
+
+
 def test_think(extension, device):
     torch.manual_seed(103)
     batch, sequence, width, vocab = 2, 7, 64, 257
@@ -240,6 +262,30 @@ def test_think(extension, device):
     native_ms = cuda_time(lambda: extension.forward(benchmark_prior, benchmark_weight, benchmark_bias, benchmark_targets, benchmark_valid), iterations=10)
     reference_ms = cuda_time(lambda: surprise_reference(benchmark_prior, benchmark_weight, benchmark_bias, benchmark_targets, benchmark_valid), iterations=10)
     emit("KOEMI_BENCH", {"kernel": "think_causal_surprise", "native_ms": native_ms, "reference_ms": reference_ms, "ratio": native_ms / reference_ms})
+    benchmark_upstream = torch.randn(4, 64, device=device)
+    native_backward_ms = cuda_time(
+        lambda: extension.backward(
+            benchmark_prior,
+            benchmark_weight,
+            benchmark_bias,
+            benchmark_targets,
+            benchmark_valid,
+            benchmark_upstream,
+        ),
+        iterations=10,
+    )
+    reference_backward_ms = cuda_time(
+        lambda: surprise_backward_reference(
+            benchmark_prior,
+            benchmark_weight,
+            benchmark_bias,
+            benchmark_targets,
+            benchmark_valid,
+            benchmark_upstream,
+        ),
+        iterations=10,
+    )
+    emit("KOEMI_BENCH", {"kernel": "think_causal_surprise_backward", "native_ms": native_backward_ms, "reference_ms": reference_backward_ms, "ratio": native_backward_ms / reference_backward_ms})
     emit("KOEMI_PASS", {"kernel": "think_causal_surprise", "checks": ["forward", "backward", "causal_mask", "benchmark"]})
 
 
