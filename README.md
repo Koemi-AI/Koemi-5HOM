@@ -1,15 +1,24 @@
-# Koemi-4HCM
+# Koemi-5HOM
 
-**Koemi-4 HERM Consolidation Model** is an open-source PyTorch research base
+**Koemi-5 HERM Optimized Model** is an open-source PyTorch research base
 for causal models with bounded recurrent state, hierarchical associative memory,
-exact bounded recall, deterministic MoE routing, checkpoint integrity, and
-optional native CUDA operator fronts.
+exact bounded recall, hash or learned MoE routing, typed decision training,
+checkpoint integrity, and optional native CUDA operator fronts.
+
+Version 0.5.0 adds an optional learned top-k gate after HERM fusion and a
+supervised trainer for the Laya decision architecture. **MDT (Modelo de
+Decisão Tipada)** names the typed decision path. DeepGEMM informs the
+separation of routing and grouped execution; its SM90/SM100 kernels are not
+integrated or claimed to accelerate the A100. See the
+[5HOM implementation contract and reference study](docs/KOEMI_5HOM.md).
 
 The source release is MIT-licensed. This repository does not ship trained
 weights or a training corpus. Code, weights, datasets, and trademarks are
 separate artifacts and must keep their own licensing decision.
 
-- Release dossier: [`docs/KOEMI_4HCM_RELEASE.md`](docs/KOEMI_4HCM_RELEASE.md)
+- Current version: [`docs/KOEMI_5HOM.md`](docs/KOEMI_5HOM.md)
+- MDT training introduction (Portuguese): [`docs/MDT_TRAINING.md`](docs/MDT_TRAINING.md)
+- Historical 4HCM dossier: [`docs/KOEMI_4HCM_RELEASE.md`](docs/KOEMI_4HCM_RELEASE.md)
 - Architecture: [`docs/KOEMI_ARCHITECTURE.md`](docs/KOEMI_ARCHITECTURE.md)
 - Identity and licensing: [`docs/MODEL_IDENTITY_AND_LICENSING.md`](docs/MODEL_IDENTITY_AND_LICENSING.md)
 - A100 training: [`docs/A100_SAFE_TRAINING.md`](docs/A100_SAFE_TRAINING.md)
@@ -99,6 +108,8 @@ Python 3.11 or newer is required. The package declares `numpy>=2.1` and
 `torch>=2.8`.
 
 ```bash
+git clone https://github.com/Koemi-AI/Koemi-5HOM.git
+cd Koemi-5HOM
 python -m venv .venv
 
 # Linux/macOS
@@ -256,7 +267,7 @@ flowchart LR
     M --> Y[Byte or hybrid vocabulary head]
 ```
 
-## Deterministic MoE
+## Hash and learned MoE
 
 The regular HERM MoE path is deliberately predictable. A content hash of the
 current and previous byte selects `expert_top_k` experts. Position is not part
@@ -266,12 +277,64 @@ appears.
 - `--expert-count 0` disables the bank.
 - `--expert-top-k 1` preserves the lowest-cost path.
 - A `128/6` configuration activates six deterministic experts per valid byte.
-- There is no learned router, routing loss, risk head, or semantic-routing
-  claim.
+- Hash remains the compatibility default. `--expert-routing learned` selects
+  a gate trained from the fused causal context, with unique top-k experts and
+  selected softmax probabilities weighting the residual update.
+- `--expert-load-balance-weight` scales a whole-forward auxiliary loss.
+  Logs expose `router_loss` and expert occupancy; validation perplexity
+  excludes that auxiliary loss.
+- `--expert-dispatch segments` groups token rows by expert for training.
+  This is a PyTorch implementation with a CUDA count synchronization, not
+  a DeepGEMM kernel or a measured speed improvement.
 - Load balance is measured from the run; it is not assumed from the hash.
 
 The native MoE path is inference-only and stricter than the legacy route: it
 rejects duplicate valid assignments and never routes padding.
+
+Train the learned route:
+
+```bash
+python -m koemi train --dataset examples/canonical.jsonl \
+  --checkpoint artifacts/koemi-5hom.pt --expert-count 8 --expert-top-k 2 \
+  --expert-routing learned --expert-dispatch segments \
+  --expert-load-balance-weight 0.01
+```
+
+Learned routing is functional and tested, but semantic specialization and a
+quality gain over hash routing require a matched multi-seed comparison.
+
+## MDT: simpler typed decision training
+
+Start with the [MDT training introduction](docs/MDT_TRAINING.md) for dataset
+format, checkpoint requirements, training controls and prediction examples.
+
+The optional Laya adapter accepts labeled `state`, `questions`, and `gold`
+JSONL rows. It trains option distributions directly with soft cross-entropy
+and an ordinal CDF term for scores. It supports encoder freezing, separate
+learning rates and accumulation weighted by the number of decisions.
+Calibration splits by complete state before training, keeping duplicate states
+and their questions together. The exported directory loads in Laya.
+
+```bash
+python -m pip install -e ".[decisions]"
+python -m koemi.training.laya_decisions \
+  --model-directory /path/to/local/laya-checkpoint \
+  --dataset examples/typed_decisions.jsonl \
+  --output artifacts/laya-supervised --freeze-encoder
+```
+
+This command requires a complete local checkpoint and does not fetch weights.
+It writes safetensors, tokenizer/encoder config, per-type temperatures and a
+training report to a new directory. Existing output directories are refused.
+The tiny example checks the pipeline; it is not a useful training corpus.
+The act/escalate head is preserved but receives no new supervision; it must
+not be used as newly trained correctness confidence.
+
+`koemi.model.decisions.typed_decisions` converts option logits into `choice`,
+ordinal expected `score`, or yes-probability `noul` answers without generating
+text. `max_probability` describes the option distribution and is not an
+epistemic correctness guarantee. The HERM language checkpoint and the Laya
+decision checkpoint are separate architectures and artifact formats.
 
 ## MoE Submapping: keep the bank in storage, move selected blocks
 
@@ -306,9 +369,9 @@ from koemi.model.identity import ModelIdentity, ModelLicensing
 
 identity = ModelIdentity(
     organization="Koemi Labs",
-    model_name="Koemi-4HCM",
-    version="0.4.0",
-    heading="Koemi-4HCM by Koemi Labs",
+    model_name="Koemi-5HOM",
+    version="0.5.0",
+    heading="Koemi-5HOM by Koemi Labs",
     architecture="HERM",
     licensing=ModelLicensing(
         source_license="MIT",
@@ -444,8 +507,11 @@ complete parser surface.
 | `--local-memory-size` | `16` | Exact recent key-value slots. |
 | `--salience-memory-size` | `16` | Exact surprise-admitted slots. |
 | `--salience-threshold` | `0.75` | Surprise required for salient admission. |
-| `--expert-count` | `0` | Deterministic expert count; zero disables the bank. |
+| `--expert-count` | `0` | Expert count; zero disables the bank. |
 | `--expert-top-k` | `1` | Experts active per valid token. |
+| `--expert-routing` | `hash` | Hash routing or trainable causal `learned` gate. |
+| `--expert-dispatch` | `loop` | Reference loop or sorted `segments` training layout. |
+| `--expert-load-balance-weight` | `0.01` | Learned gate auxiliary balance weight. |
 | `--scan-chunk` | `128` | Sequence window used by the parallel scan. |
 | `--refine-decay-rate` | `0.0625` | Timescale of the slower refine memory. |
 | `--ablation` | `no_refine` | `herm`, `no_refine`, `no_surprise`, or `affine`. |
@@ -565,7 +631,9 @@ python -m unittest discover -s tests -p "test*.py"
 python -m compileall -q src benchmarks tests
 ```
 
-The release preparation passed `548` tests with `16` conditional CUDA skips.
+Koemi-5HOM verification passed `573` tests, including `25` new routing and
+decision-training tests, with `16` conditional CUDA skips. Optional Laya
+integration tests were executed with the pinned dependency installed.
 The local host is CPU-only, so local tests prove contracts and fallback behavior,
 not GPU throughput.
 
@@ -605,13 +673,13 @@ model quality.
 
 ## What is deliberately not claimed
 
-- Koemi-4HCM is not presented as a Transformer replacement or a quality win.
+- Koemi-5HOM is not presented as a Transformer replacement or a quality win.
 - Native CUDA fronts are not integrated into the default runner.
 - A100 operator speed is not the same as end-to-end model speed.
 - The think front is not a fully fused custom GEMM.
 - The MoE Submapping slice is not yet a production cube/mmap/NVMe engine.
 - MoE native kernels are inference-only and have no backward path yet.
-- Learned semantic routing, distributed training, Triton kernels, semantic
+- Proven semantic specialization, distributed training, Triton kernels, semantic
   retrieval, persistent episodic memory, and tool use are outside this release.
 - The identity header does not teach a model to say its own name.
 - SSD exact-prefix reuse is not semantic retrieval and disk offload is not a

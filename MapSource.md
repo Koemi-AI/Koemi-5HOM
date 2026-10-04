@@ -1,27 +1,39 @@
 ---
 prumo_protocol: "2.0.0"
 schema: 2
-updated_at: 2026-09-18
+updated_at: 2026-10-04
 ---
 
-# MapSource - Koemi-4HCM
+# MapSource - Koemi-5HOM
 
 ## Goal
 
-Consolidar a Koemi-3HIP em Koemi-4HCM, uma base causal de treino com memoria
-hierarquica scanavel, treino instrumentado, identidade de artefato e uso
-heterogeneo de recursos sem desperdicio deliberado.
+Evoluir a base HERM causal para Koemi-5HOM (HERM Optimized Model), com MoE
+aprendido opt-in, despacho ponderado por probabilidades e MDT (Modelo de
+Decisão Tipada) para treinamento supervisionado de decisoes tipadas.
 
 ## Release status
 
-Koemi-4HCM, versao de consolidacao tecnica para fonte, runners, checkpoints,
-identidade e frentes nativas CUDA. Os gates de recall, ablacao, comparacao com
-baselines e integracao end-to-end CUDA ainda precisam ser fechados.
+Koemi-5HOM, fonte experimental 0.5.0. O default hash e os checkpoints de
+formato 7 continuam compativeis; o gate aprendido e opt-in. O treino de
+decisoes Laya e separado do checkpoint HERM. Ganhos de qualidade, throughput
+CUDA e especializacao semantica continuam sem validacao nesta frente.
+
+A nomenclatura atual e MDT / Modelo de Decisão Tipada, que descreve os tipos
+de saida. O usuario autorizou criar e publicar a versao em um repositorio novo:
+`https://github.com/Koemi-AI/Koemi-5HOM`. O repositorio publico foi criado;
+`origin` aponta para ele e `koemi-4hcm` preserva o remoto historico.
 
 ## Active specification
 
 ### Scope
 
+- Frente 5HOM: contrato em `docs/KOEMI_5HOM.md`; gate top-k aprendido causal,
+  estatisticas aditivas por forward, perda auxiliar fora da perplexidade de
+  validacao, despacho loop/segments, CLI e checkpoint. MDT oferece outputs
+  tipados e treino supervisionado FP32 com perda ordinal, encoder congelavel,
+  acumulacao por exemplos e calibracao separada por estado. Laya e dependencia
+  opcional `koemi[decisions]`, fixada em 0.3.27; nenhuma descarga de pesos.
 - Memoria HERM: estado associativo rapido mais memoria lenta de residuos,
   ambos limitados, normalizados e compativeis com affine scan.
 - Surpresa causal real: NLL do byte observado sob a previsao do estado anterior.
@@ -43,8 +55,8 @@ baselines e integracao end-to-end CUDA ainda precisam ser fechados.
   usando o mesmo corpus, budget e tres seeds por configuracao.
 - Banco de experts treinavel com despacho hash deterministico; `expert_top_k=1`
   preserva o caminho legado e valores maiores ativam varios experts por token.
-  O top-k atual nao e um gate aprendido e nao reivindica especializacao sem
-  medir carga e qualidade.
+  O top-k hash legado nao usa um gate aprendido; a rota aprendida e opt-in.
+  Nenhuma rota reivindica especializacao sem medir carga e qualidade.
 - Frente 2026-09-13: ledger persistente de estados por prefixo, read associativo
   sem o intermediario `[B,L,d,m]`, partida com confianca limitada, buffer exato
   causal de saliencia, hash MoE independente de posicao e refine fora do default.
@@ -1056,6 +1068,9 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
 
 ## Work fronts
 
+- [x] Fonte 5HOM: gate aprendido e treino MDT implementados; suite final
+  executou 573 testes com 16 skips CUDA. Treino, calibracao, exportacao e
+  recarga pela API publica Laya passaram; qualidade e CUDA nao foram medidos.
 - [x] Koemi-1FPA research prototype, historical.
 - [x] Koemi-3HIP implementation.
 - [x] Koemi-3HIP verification and documentation.
@@ -1114,6 +1129,47 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   O runner A100 continua byte-only por decisao de risco.
 
 ## Suspicion zone
+
+### KOEMI-062 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/router.py:35`
+- Condition: learned routing has local gradient/equivalence tests but no
+  matched multi-seed quality comparison against the existing hash.
+- Impact: additional gate parameters may reduce quality or concentrate load.
+- Evidence: the opt-in CLI smoke trains; this does not establish specialization.
+
+### KOEMI-063 #risk/medium
+
+- Severity: medium
+- Status: open
+- Location: `src/koemi/model/router.py:80`
+- Condition: sorted training dispatch transfers counts to the host; static
+  inference selects parameter slices per token/expert pair.
+- Impact: CUDA synchronization and parameter-copy memory can erase gains.
+- Evidence: CPU equivalence passes; no new CUDA measurement was performed.
+
+### KOEMI-064 #risk/high
+
+- Severity: high
+- Status: open
+- Location: `src/koemi/training/laya_decisions.py:216`
+- Condition: supervised decision training preserves Laya's act head but
+  supplies no act/escalate target; tiny calibration sets can overfit a temperature.
+- Impact: action confidence and calibration generalization remain unproven.
+- Evidence: export report sets act_head_trained and independent evaluation false.
+
+### KOEMI-065 #risk/low
+
+- Severity: low
+- Status: mitigated
+- Location: `tests/training/test_laya_decisions.py:133`
+- Condition: PyPI laya 0.3.27 does not package laya.backends, so passing an
+  explicit backend to its loader raises ModuleNotFoundError.
+- Impact: explicit backend selection remains unusable in that external wheel.
+- Evidence: backend=eager failed; the default public loader loaded the exported
+  checkpoint and predicted. Koemi does not call the missing backend API.
 
 ### KOEMI-001 #risk/high
 
@@ -2133,6 +2189,46 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   padding, 257-260 are the span markers and merges start at 261.
 
 ## Verification status
+
+### 2026-10-04 - Koemi-5HOM experimental source
+
+- Publicacao autorizada: repositorio publico `Koemi-AI/Koemi-5HOM` criado e
+  confirmado pela API com permissao ADMIN. O origin antigo foi preservado
+  como koemi-4hcm; nenhuma escrita remota foi feita no repositorio 4HCM.
+- Introducao em portugues adicionada em `docs/MDT_TRAINING.md`, ligada no
+  README e no contrato 5HOM. JSON do guia conferido contra o exemplo real;
+  os schemas choice/score/noul passaram na validacao do Laya instalado.
+- Os 16 arquivos de implementacao/testes/configuracao/exemplos continuam com
+  os mesmos blobs da implementacao testada em 573 testes. O comando --help
+  do treinador passou novamente. Revisao de padroes conhecidos de secrets e
+  arquivos acima de 50 MiB nao encontrou itens nos arquivos a publicar.
+- Nomenclatura substituida por MDT (Modelo de Decisão Tipada) no README,
+  contrato, arquitetura e estado ativo deste mapa. Mudanca apenas documental;
+  referencias e whitespace conferidos, sem novo commit.
+- Por pedido do usuario, `git reset --mixed 5af06ca` retirou `aef3c1d` da
+  linha main e preservou as alteracoes sem commit. Os blobs dos 20 arquivos
+  foram conferidos contra o commit retirado antes desta anotacao; todos
+  permaneceram identicos. HEAD e index foram verificados; nenhum push ocorreu.
+- `.koemi-venv/Scripts/python.exe -m unittest discover -s tests -p 'test*.py'`:
+  573 tests in 152.084 seconds, OK, 16 CUDA skips. All 25 new tests passed,
+  including the optional real-Laya training/export/public-loader integration.
+- `python -m compileall -q src benchmarks tests`, `python -m pip check` and
+  `git diff --check`: exit 0; no broken package requirements.
+- CPU environment: Koemi 0.5.0, PyTorch 2.14.1+cpu, Laya 0.3.27. Missing MSVC
+  DLLs were supplied inside the ignored venv via msvc-runtime 14.44.35112;
+  no machine-wide runtime installation was performed.
+- CLI learned/segments smoke: width 16, four experts/top-2, sequence 32,
+  chunk 8, two epochs; four optimizer steps, validation NLL 5.719637 then
+  5.699242, mean router loss 0.010676. Checkpoint reload/generation exited 0.
+- Calibration regression first failed with `9.865206718444824 not less than
+  or equal to 5.0`: generic fitting exceeded Laya 0.3.27 runtime limits.
+  The adapter now passes the runtime bounds to fitting; the regression and
+  saved-versus-loaded temperature equality passed in the final suite.
+- No pretrained weights were downloaded or trained; no GPU measurement,
+  matched quality comparison, native DeepGEMM integration or action-head
+  training was performed. Reference study and runnable commands are in
+  `docs/KOEMI_5HOM.md`. Prumo chapter files/CLI were unavailable locally;
+  no full chapter audit is claimed.
 
 - 2026-09-13: `origin` was repointed to `Koemi-3HIP`; no push was performed by
   this session.

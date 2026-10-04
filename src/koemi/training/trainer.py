@@ -33,6 +33,7 @@ class TrainingResult:
     tokens_per_second: float
     final_learning_rate: float
     precision: str
+    mean_router_loss: float = 0.0
 
 
 class Trainer:
@@ -101,7 +102,7 @@ class Trainer:
             self.logger.info(
                 "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f surprise=%.4f "
                 "validation_loss=%s validation_perplexity=%s learning_rate=%.8f optimizer_steps=%s "
-                "supervised_tokens=%s tokens=%s expert_activations=%s precision=%s",
+                "supervised_tokens=%s tokens=%s expert_activations=%s precision=%s router_loss=%.6f",
                 epoch_index,
                 epoch_metrics.mean_loss,
                 epoch_metrics.mean_task_loss,
@@ -115,6 +116,7 @@ class Trainer:
                 epoch_metrics.token_count,
                 epoch_metrics.expert_activation_counts,
                 precision,
+                epoch_metrics.mean_router_loss,
             )
             accumulator.merge(epoch_metrics)
         elapsed_seconds = time.perf_counter() - start_time
@@ -156,6 +158,7 @@ class Trainer:
                         thinking_mask,
                         settings.thinking_loss_weight,
                         settings.label_smoothing,
+                        include_router_loss=False,
                     )
                 metrics.add(output, objective, supervised_count)
         model.train()
@@ -234,6 +237,7 @@ class MetricAccumulator:
         self.weighted_loss = 0.0
         self.weighted_task_loss = 0.0
         self.weighted_thinking_loss = 0.0
+        self.weighted_router_loss = 0.0
         self.surprise_total = 0.0
         self.supervised_token_count = 0
         self.token_count = 0
@@ -243,6 +247,8 @@ class MetricAccumulator:
         self.weighted_loss += float(objective.total_loss.detach()) * supervised_count
         self.weighted_task_loss += float(objective.task_loss.detach()) * supervised_count
         self.weighted_thinking_loss += float(objective.thinking_loss.detach()) * supervised_count
+        if objective.router_loss is not None:
+            self.weighted_router_loss += float(objective.router_loss.detach()) * supervised_count
         self.surprise_total += float(output.surprise_values.masked_select(output.valid_positions).sum().detach())
         self.supervised_token_count += supervised_count
         self.token_count += output.token_count
@@ -281,6 +287,7 @@ class MetricAccumulator:
         self.weighted_loss += other.weighted_loss
         self.weighted_task_loss += other.weighted_task_loss
         self.weighted_thinking_loss += other.weighted_thinking_loss
+        self.weighted_router_loss += other.weighted_router_loss
         self.surprise_total += other.surprise_total
         self.supervised_token_count += other.supervised_token_count
         self.token_count += other.token_count
@@ -300,6 +307,10 @@ class MetricAccumulator:
     @property
     def mean_thinking_loss(self) -> float:
         return self.average(self.weighted_thinking_loss)
+
+    @property
+    def mean_router_loss(self) -> float:
+        return self.average(self.weighted_router_loss)
 
     @property
     def mean_surprise(self) -> float:
@@ -329,4 +340,5 @@ class MetricAccumulator:
             self.supervised_token_count / elapsed_seconds,
             final_learning_rate,
             precision,
+            self.mean_router_loss,
         )

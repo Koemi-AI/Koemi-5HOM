@@ -4,11 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "koemi"
-version = "0.4.0"
-description = "Koemi-4HCM (Koemi-4 HERM Consolidation Model) byte-level causal training architecture"
+version = "0.5.0"
+description = "Koemi-5HOM (Koemi-5 HERM Optimized Model) causal architecture with learned MoE routing and typed decision training"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.1", "torch>=2.8"]
+
+[project.optional-dependencies]
+decisions = ["laya==0.3.27"]
 
 [project.scripts]
 koemi = "koemi.cli:main"

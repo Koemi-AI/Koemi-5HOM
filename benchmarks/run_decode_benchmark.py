@@ -159,7 +159,7 @@ def run_speculative(model, tokenizer, arguments, drafter_factory) -> tuple[int, 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_decode_benchmark",
-        description="Compare the decode paths of a Koemi-4HCM checkpoint on one device",
+        description="Compare the decode paths of a Koemi checkpoint on one device",
     )
     parser.add_argument("--checkpoint", default=None, help="Checkpoint to measure; omit to use random weights")
     parser.add_argument("--draft-checkpoint", default=None, help="Smaller checkpoint used as the drafter")
@@ -235,7 +235,7 @@ def main(argument_values: list[str] | None = None) -> int:
             )
         )
     payload = {
-        "architecture": "Koemi-4HCM",
+        "architecture": "Koemi-5HOM",
         "device": arguments.device,
         "torch_version": torch.__version__,
         "cuda_available": torch.cuda.is_available(),

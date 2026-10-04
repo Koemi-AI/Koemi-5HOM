@@ -66,14 +66,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="koemi", description="Koemi-4HCM byte-level causal training base")
+    parser = argparse.ArgumentParser(prog="koemi", description="Koemi-5HOM HERM training and learned routing")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     inspect_parser = subparsers.add_parser("inspect-dataset", help="Validate and summarize JSON datasets")
     add_dataset_arguments(inspect_parser)
 
-    train_parser = subparsers.add_parser("train", help="Train a Koemi-4HCM checkpoint from JSON datasets")
+    train_parser = subparsers.add_parser("train", help="Train a Koemi-5HOM checkpoint from JSON datasets")
     add_dataset_arguments(train_parser)
     train_parser.add_argument("--checkpoint", required=True, help="Output checkpoint path")
     train_parser.add_argument("--overwrite", action="store_true", help="Replace an existing checkpoint")
@@ -132,7 +132,7 @@ def create_parser() -> argparse.ArgumentParser:
     expand_parser.add_argument("--output", required=True, help="Expanded checkpoint path")
     expand_parser.add_argument("--overwrite", action="store_true")
 
-    generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi-4HCM checkpoint")
+    generate_parser = subparsers.add_parser("generate", help="Generate text from a Koemi checkpoint")
     generate_parser.add_argument("--checkpoint", required=True, help="Checkpoint path")
     generate_parser.add_argument("--prompt", required=True, help="User text used to start generation")
     generate_parser.add_argument("--system", default=None, help="System text placed before the user text")
@@ -280,6 +280,9 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--salience-threshold", type=float, default=0.75)
     parser.add_argument("--expert-count", type=int, default=0)
     parser.add_argument("--expert-top-k", type=int, default=1)
+    parser.add_argument("--expert-routing", choices=("hash", "learned"), default="hash")
+    parser.add_argument("--expert-dispatch", choices=("loop", "segments"), default="loop")
+    parser.add_argument("--expert-load-balance-weight", type=float, default=0.01)
     parser.add_argument("--cache-capacity", type=int, default=256)
     parser.add_argument("--scan-chunk", type=int, default=128)
     parser.add_argument("--refine-decay-rate", type=float, default=0.0625)
@@ -367,7 +370,7 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         "training_completed checkpoint=%s mean_loss=%.6f task_loss=%.6f thinking_loss=%.6f "
         "mean_surprise=%.4f validation_loss=%s validation_perplexity=%s optimizer_steps=%s "
         "tokens_per_second=%.2f final_learning_rate=%.8f precision=%s supervised_tokens=%s tokens=%s "
-        "expert_activations=%s elapsed_seconds=%.3f",
+        "expert_activations=%s elapsed_seconds=%.3f router_loss=%.6f",
         checkpoint_path,
         result.mean_loss,
         result.mean_task_loss,
@@ -383,6 +386,7 @@ def train_model(arguments: argparse.Namespace, logger) -> int:
         result.token_count,
         result.expert_activation_counts,
         result.elapsed_seconds,
+        result.mean_router_loss,
     )
     return 0
 
@@ -717,6 +721,9 @@ def create_model_settings(
         salience_threshold=arguments.salience_threshold,
         expert_count=arguments.expert_count,
         expert_top_k=arguments.expert_top_k,
+        expert_routing=arguments.expert_routing,
+        expert_dispatch=arguments.expert_dispatch,
+        expert_load_balance_weight=arguments.expert_load_balance_weight,
         cache_capacity=arguments.cache_capacity,
         scan_chunk=arguments.scan_chunk,
         refine_decay_rate=arguments.refine_decay_rate,

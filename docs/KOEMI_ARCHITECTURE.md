@@ -1,7 +1,7 @@
-# Koemi-4HCM architecture
+# Koemi-5HOM architecture
 
-Koemi-4HCM (Koemi-4 HERM Consolidation Model) is the current consolidation
-architecture for training causal models in the Koemi infrastructure. It started
+Koemi-5HOM (Koemi-5 HERM Optimized Model) extends the 4HCM consolidation
+architecture with optional learned MoE routing and separate typed decision training. It started
 as Koemi-3HIP (Koemi-3 HERM Initial Phase). Its state family is HERM (Hierarchical Error-Refined
 Memory). HERM is an architecture and runtime mechanism; it is not a trained
 model by itself.
@@ -16,13 +16,13 @@ path as a numerical oracle for the parallel path.
 The project takes its memory vocabulary from [Titans + MIRAS](https://research.google/blog/titans-miras-helping-ai-have-long-term-memory/).
 MIRAS separates memory architecture, attentional bias, retention gate and
 memory algorithm. Titans is a concrete architecture that uses an online-updated
-neural memory. Koemi-4HCM currently uses a bounded associative state and does
+neural memory. Koemi-5HOM currently uses a bounded associative state and does
 not claim to reproduce Titans.
 
 ## Non-goals
 
 - Transformer parity without a measured benchmark.
-- Learned token routing or adaptive deep paths.
+- Adaptive deep paths or unmeasured semantic-specialization claims.
 - Persistent prompt memory by default.
 - Arbitrary semantic reuse from a cache without a retrieval index.
 - Disk-backed execution of arbitrary layers.
@@ -47,7 +47,7 @@ flowchart LR
     SLOW --> Fuse
     L --> Fuse
     A --> Fuse
-    Fuse --> E[Optional expert by mixed bigram hash]
+    Fuse --> E[Optional expert by hash or learned top-k gate]
     E --> Head[Byte logits]
     Disk[Optional SSD prefix ledger] -. longest exact prefix .-> H
 ```
@@ -152,7 +152,7 @@ sees carried entries and admitted positions strictly before itself; future
 admissions cannot change an earlier output. `S=16` and `tau=0.75` are experiment
 defaults, not demonstrated quality optima.
 
-### 6. Fusion and fixed-dispatch MoE
+### 6. Fusion and MoE
 
 The four states are concatenated into one typed context:
 
@@ -160,7 +160,7 @@ The four states are concatenated into one typed context:
 z_t = RMSNorm(W_z [h_t || m_t || l_t || a_t] + b_z)
 ```
 
-When `expert_count = E > 0`, dispatch is fixed and deterministic:
+When `expert_count = E > 0` and `expert_routing = hash`, dispatch is fixed and deterministic:
 
 ```text
 e_{t,k} = (mix_hash(token_id_t, token_id_(t-1)) + k·0x9E3779B9) mod E
@@ -168,11 +168,29 @@ y_t = RMSNorm(z_t + (1/K) Σ_k FFN_{e_{t,k}}(z_t))
 ```
 
 `K = expert_top_k` experts process each valid token (the default `K=1` preserves
-the legacy path). There is no routing projection, risk head, soft mixture or
-routing loss. This is a deliberate trade-off: Koemi-4HCM has a predictable sparse
-expert bank, not learned semantic MoE dispatch. `expert_count = 0` skips the bank.
+the legacy path). Hash routing has no gate projection or auxiliary loss.
+`expert_count = 0` skips the bank.
 
-Absolute position is excluded so a repeated bigram has a stable expert. The
+The opt-in `expert_routing = learned` route reads the causal fused context:
+
+```text
+p_t = softmax(W_gate z_t)
+I_t = top_k(p_t)
+y_t = RMSNorm(z_t + sum_{e in I_t} p_(t,e) FFN_e(z_t))
+```
+
+Selected weights retain their full-softmax mass, so top-k one still propagates
+the task gradient into the gate. No token is dropped. Whole-forward valid-token
+probability mass and assignment counts produce an auxiliary balance term; the
+term is excluded from validation perplexity. Sorted training dispatch groups
+rows by expert with ordinary PyTorch autograd, retaining a reference loop for
+hooks and offload. CPU equivalence is verified; CUDA speed is unmeasured.
+
+MDT decision training is a separate bidirectional Laya encoder/head contract,
+not a conversion of a HERM language checkpoint. See [the 5HOM contract](KOEMI_5HOM.md)
+for the supervised objective, state-level calibration split and artifact layout.
+
+For hash routing, absolute position is excluded so a repeated bigram has a stable expert. The
 mixing finalizer prevents power-of-two expert counts from reading only the low
 bits of an affine byte combination.
 
@@ -201,7 +219,7 @@ as a hidden cognition claim.
 
 ## Cache tiers and chains
 
-Koemi-4HCM has explicit cache tiers:
+Koemi-5HOM has explicit cache tiers:
 
 | Tier | Location | Content | Reuse rule |
 | --- | --- | --- | --- |
@@ -244,13 +262,13 @@ async scheduling or paging active layers to disk is intentionally not used as a
 performance claim.
 
 Training defaults to CUDA when available in the CLI and falls back to CPU. The
-model does not allocate a second deep path, so removing routing reduces
-parameters and intermediate tensors directly. Actual speed and VRAM changes
-must be measured by a Koemi-4HCM benchmark on the target device.
+model does not allocate a second deep path. Hash routing has no learned gate;
+the opt-in learned route adds its projection and balance statistics. Actual
+speed and VRAM changes must be measured on the target device.
 
 ## Native CUDA fronts
 
-Koemi-4HCM includes four opt-in native CUDA slices under
+Koemi-5HOM retains the four opt-in native CUDA slices from 4HCM under
 [`src/koemi/cuda_kernels/`](../src/koemi/cuda_kernels/): core fused RMSNorm/SiLU,
 dense affine scan, causal think/surprise and MoE route/permute/group/combine.
 The A100 harness compiled and contract-checked all four. Core, dense and think
@@ -271,6 +289,8 @@ fully fused standalone matrix-multiply implementation.
 | Surprise write scaling | `model/network.py` | implemented |
 | Exact local and salient rings with validity | `model/memory.py` | implemented |
 | Fixed-dispatch MoE | `model/experts.py` | implemented |
+| Optional learned top-k MoE | `model/router.py` | CPU logits/gradient equivalence verified |
+| Supervised typed decisions and Laya adapter | `training/decisions.py`, `training/laya_decisions.py` | implemented; separate architecture |
 | Thinking mask and weighted loss | `training/dataset.py`, `training/objective.py` | implemented |
 | RAM warm embedding cache | `model/cache.py` | implemented |
 | Optional SSD exact prefix ledger | `model/cache.py`, `training/generation.py` | implemented |
@@ -283,7 +303,7 @@ fully fused standalone matrix-multiply implementation.
 
 - MQAR, copy and needle recall at a budget where at least one baseline solves
   the task;
-- Koemi-4HCM versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
+- Koemi-5HOM versus GRU, LSTM, Mamba-2, Gated DeltaNet and a Transformer at matched
   tokenizer, parameter count, token budget, precision and device;
 - p50/p95 training and decode throughput, peak VRAM/RAM and state bytes;
 - ablations for `expert_count`, local window, memory feature width and cache
@@ -291,5 +311,5 @@ fully fused standalone matrix-multiply implementation.
 - cache invalidation, corruption, retention and cross-session isolation tests;
 - NaN/Inf, state norm, surprise distribution and write-rate reports.
 
-Until those gates run, Koemi-4HCM is a research hypothesis with executable contracts,
+Until those gates run, Koemi-5HOM is a research hypothesis with executable contracts,
 not evidence that Koemi models are comparable to a production AI system.

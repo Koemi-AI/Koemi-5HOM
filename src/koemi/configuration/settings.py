@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -27,6 +28,8 @@ class ModelSettings:
     compile_forward: bool = False
     refine_decay_rate: float = 0.0625
     ablation: str = "no_refine"
+    expert_routing: str = "hash"
+    expert_load_balance_weight: float = 0.01
 
     def __post_init__(self) -> None:
         if self.vocabulary_size < BYTE_VOCABULARY_SIZE + 1:
@@ -51,6 +54,12 @@ class ModelSettings:
             raise ValueError("expert_top_k must not exceed expert_count")
         if self.expert_dispatch not in {"loop", "segments"}:
             raise ValueError("expert_dispatch must be loop or segments")
+        if self.expert_routing not in {"hash", "learned"}:
+            raise ValueError("expert_routing must be hash or learned")
+        if self.expert_routing == "learned" and (self.expert_count < 1 or self.ablation == "affine"):
+            raise ValueError("learned routing requires experts and a non-affine ablation")
+        if not math.isfinite(self.expert_load_balance_weight) or self.expert_load_balance_weight < 0:
+            raise ValueError("expert_load_balance_weight must be finite and non-negative")
         if not isinstance(self.activation_checkpointing, bool):
             raise TypeError("activation_checkpointing must be a boolean")
         if not isinstance(self.compile_forward, bool):

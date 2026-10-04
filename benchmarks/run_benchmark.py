@@ -354,7 +354,7 @@ def run_every_model(arguments: argparse.Namespace) -> list[dict]:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Koemi-4HCM benchmark against GRU and LSTM baselines")
+    parser = argparse.ArgumentParser(description="Koemi-5HOM benchmark against GRU and LSTM baselines")
     parser.add_argument("--model", choices=MODEL_NAMES, default=None)
     parser.add_argument("--task", choices=TASK_NAMES, default="bytes")
     parser.add_argument("--seed", type=int, default=17)
@@ -382,7 +382,7 @@ def main(argument_values: list[str] | None = None) -> int:
         print(json.dumps(asdict(run_single_model(arguments)), indent=2, sort_keys=True))
         return 0
     payload = {
-        "architecture": "Koemi-4HCM",
+        "architecture": "Koemi-5HOM",
         "task": arguments.task,
         "seed": arguments.seed,
         "platform": sys.platform,

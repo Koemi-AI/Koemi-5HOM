@@ -19,6 +19,7 @@ from koemi.model.memory import (
     LocalKeyValueMemory,
     MemoryWriteTerms,
 )
+from koemi.model.router import LearnedExpertMixture, RouterStatistics, merge_router_statistics
 from koemi.model.scan import affine_scan, previous_states
 from koemi.model.state import KOEMI_STATE_FIELDS, KoemiState
 
@@ -35,6 +36,14 @@ class KoemiOutput:
     cache_misses: int
     expert_count: int
     active_expert_indices: Tensor | None = None
+    router_statistics: RouterStatistics | None = None
+    router_balance_weight: float = 0.0
+
+    @property
+    def router_loss(self) -> Tensor:
+        if self.router_statistics is None:
+            return self.logits.new_zeros(())
+        return self.router_statistics.balance_loss * self.router_balance_weight
 
     @property
     def expert_activation_totals(self) -> Tensor | None:
@@ -87,13 +96,19 @@ class KoemiModel(nn.Module):
         )
         self.fusion_projection = nn.Linear(embedding_size * 4, embedding_size)
         self.fusion_normalizer = RootMeanSquareNorm(embedding_size)
-        self.experts = DeterministicExpertMixture(
+        mixture_class = LearnedExpertMixture if settings.expert_routing == "learned" else DeterministicExpertMixture
+        self.experts = mixture_class(
             embedding_size,
             settings.expert_count,
             settings.expert_top_k,
             settings.expert_dispatch,
         )
         self.token_predictor = nn.Linear(embedding_size, settings.vocabulary_size)
+
+    def apply_experts(self, context: Tensor, token_ids: Tensor, previous_token_ids: Tensor,
+                      valid_mask: Tensor) -> tuple[Tensor, Tensor, Tensor, RouterStatistics | None]:
+        result = self.experts(context, token_ids, previous_token_ids, valid_mask)
+        return result[0], result[1], result[2], result[3] if len(result) == 4 else None
 
     def forward(
         self,
@@ -232,17 +247,23 @@ class KoemiModel(nn.Module):
             counters["cache_misses"] = output.cache_misses
             counters["expert_count"] = output.expert_count
             counters["has_active_expert_indices"] = int(output.active_expert_indices is not None)
+            counters["has_router_statistics"] = int(output.router_statistics is not None)
             active = (
                 output.active_expert_indices
                 if output.active_expert_indices is not None
                 else output.expert_indices.unsqueeze(-1)
             )
+            statistics = output.router_statistics
+            empty = output.logits.new_empty(0)
             return (
                 output.logits,
                 output.surprise_values,
                 output.expert_indices,
                 output.valid_positions,
                 active,
+                statistics.probability_mass if statistics is not None else empty,
+                statistics.assignment_counts if statistics is not None else empty,
+                statistics.valid_count if statistics is not None else empty,
                 *(getattr(output.state, field_name) for field_name in KOEMI_STATE_FIELDS),
             )
 
@@ -254,7 +275,7 @@ class KoemiModel(nn.Module):
         )
         logits, surprise_values, expert_indices, valid_positions, active = results[:5]
         next_state = KoemiState(
-            *results[5:],
+            *results[8:],
             step_index=step_index + input_ids.shape[1],
         )
         return KoemiOutput(
@@ -268,6 +289,8 @@ class KoemiModel(nn.Module):
             cache_misses=counters["cache_misses"],
             expert_count=counters["expert_count"],
             active_expert_indices=active if counters["has_active_expert_indices"] else None,
+            router_statistics=RouterStatistics(*results[5:8]) if counters["has_router_statistics"] else None,
+            router_balance_weight=self.settings.expert_load_balance_weight,
         )
 
     def forward_window(
@@ -363,7 +386,7 @@ class KoemiModel(nn.Module):
         )
         fused_context = self.fuse(working_states, memory_value, local_value, salient_value)
         previous_token_ids = self.previous_token_ids(input_ids, valid_mask, current_state.last_token_ids)
-        final_context, expert_indices, active_expert_indices = self.experts(
+        final_context, expert_indices, active_expert_indices, router_statistics = self.apply_experts(
             fused_context,
             input_ids,
             previous_token_ids,
@@ -413,6 +436,8 @@ class KoemiModel(nn.Module):
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
             active_expert_indices=active_expert_indices,
+            router_statistics=router_statistics,
+            router_balance_weight=self.settings.expert_load_balance_weight,
         )
 
     def forward_affine_window(
@@ -468,6 +493,7 @@ class KoemiModel(nn.Module):
         surprise_by_position: list[Tensor] = []
         expert_indices_by_position: list[Tensor] = []
         active_expert_indices_by_position: list[Tensor] = []
+        router_statistics_by_position: list[RouterStatistics] = []
         valid_by_position: list[Tensor] = []
         cache_hits = 0
         cache_misses = 0
@@ -544,7 +570,7 @@ class KoemiModel(nn.Module):
                 else self.refine_memory(working_state, fast_memory, refine_memory, local_value)
             )
             fused_context = self.fuse(working_state, memory_value, local_value, salient_value)
-            final_context, expert_indices, active_expert_indices = self.experts(
+            final_context, expert_indices, active_expert_indices, router_statistics = self.apply_experts(
                 fused_context.unsqueeze(1),
                 token_ids.unsqueeze(1),
                 current_state.last_token_ids.unsqueeze(1),
@@ -554,6 +580,8 @@ class KoemiModel(nn.Module):
             surprise_by_position.append(surprise)
             expert_indices_by_position.append(expert_indices[:, 0])
             active_expert_indices_by_position.append(active_expert_indices[:, 0])
+            if router_statistics is not None:
+                router_statistics_by_position.append(router_statistics)
             valid_by_position.append(valid_mask)
 
             fast_terms = self.associative_memory.fast_write_terms(projection, surprise)
@@ -642,6 +670,8 @@ class KoemiModel(nn.Module):
             cache_misses=cache_misses,
             expert_count=self.settings.expert_count,
             active_expert_indices=torch.stack(active_expert_indices_by_position, dim=1),
+            router_statistics=merge_router_statistics(router_statistics_by_position),
+            router_balance_weight=self.settings.expert_load_balance_weight,
         )
 
     def calculate_surprise(self, prior_states: Tensor, input_ids: Tensor, valid_mask: Tensor) -> Tensor:
@@ -802,4 +832,8 @@ def concatenate_outputs(windows: list[KoemiOutput]) -> KoemiOutput:
             if windows[0].active_expert_indices is not None
             else None
         ),
+        router_statistics=merge_router_statistics([
+            window.router_statistics for window in windows if window.router_statistics is not None
+        ]),
+        router_balance_weight=windows[0].router_balance_weight,
     )
