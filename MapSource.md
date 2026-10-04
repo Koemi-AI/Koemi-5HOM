@@ -21,7 +21,7 @@ CUDA e especializacao semantica continuam sem validacao nesta frente.
 
 A nomenclatura atual e MDT / Modelo de Decisão Tipada, que descreve os tipos
 de saida. O usuario autorizou criar e publicar a versao em um repositorio novo:
-`https://github.com/Koemi-AI/Koemi-5HOM`. O repositorio publico foi criado;
+`https://github.com/Koemi-AI/Koemi-5HOM`. O codigo-fonte foi publicado na main;
 `origin` aponta para ele e `koemi-4hcm` preserva o remoto historico.
 
 ## Active specification
@@ -2192,6 +2192,10 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
 
 ### 2026-10-04 - Koemi-5HOM experimental source
 
+- Push verificado: commit de codigo `15e3d01` publicado na main do repositorio
+  novo. A API retornou o mesmo SHA do HEAD local; blobs de README, pyproject,
+  introducao MDT e contrato 5HOM tambem coincidiram com os arquivos locais.
+  O working tree ficou limpo apos o push; esta anotacao registra a verificacao.
 - Publicacao autorizada: repositorio publico `Koemi-AI/Koemi-5HOM` criado e
   confirmado pela API com permissao ADMIN. O origin antigo foi preservado
   como koemi-4hcm; nenhuma escrita remota foi feita no repositorio 4HCM.
@@ -2204,7 +2208,7 @@ the tokens the single-stream oracle produces, and the bucket test sweeps sizes 1
   arquivos acima de 50 MiB nao encontrou itens nos arquivos a publicar.
 - Nomenclatura substituida por MDT (Modelo de Decisão Tipada) no README,
   contrato, arquitetura e estado ativo deste mapa. Mudanca apenas documental;
-  referencias e whitespace conferidos, sem novo commit.
+  referencias e whitespace conferidos, sem novo commit naquela etapa.
 - Por pedido do usuario, `git reset --mixed 5af06ca` retirou `aef3c1d` da
   linha main e preservou as alteracoes sem commit. Os blobs dos 20 arquivos
   foram conferidos contra o commit retirado antes desta anotacao; todos
